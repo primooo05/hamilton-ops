@@ -130,9 +130,6 @@ class DockerDriver:
         version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
         return DriverResult(success=True, output={"version": version})
 
-    # ------------------------------------------------------------------
-    # Command construction — pure, directly testable
-    # ------------------------------------------------------------------
 
     def _build_command(self) -> list[str]:
         """
@@ -152,10 +149,6 @@ class DockerDriver:
         # Build context last — always the immutable staging directory.
         cmd.append(str(self.stage_path))
         return cmd
-
-    # ------------------------------------------------------------------
-    # Error mapping — exit code → Hamilton signal
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _map_exit_code(code: int, stderr: str) -> None:
