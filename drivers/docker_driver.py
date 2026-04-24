@@ -37,7 +37,6 @@ logger = logging.getLogger("hamilton.drivers.docker")
 _EXIT_NOT_FOUND = 127
 _EXIT_OOM       = 137
 
-
 class DockerDriver:
     """
     Stateless translation layer for the Docker BuildKit engine (P3 Construction).
