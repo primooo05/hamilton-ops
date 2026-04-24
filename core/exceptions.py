@@ -77,6 +77,17 @@ class SecretLeakDetected(AuditFailure):
     """
     pass
 
+class BuildToolLeakDetected(AuditFailure):
+    """
+    Raised when the binary audit discovers build tools (gcc, mvn, npm, etc.)
+    that survived into the production image.
+
+    Per Pillar C, any dev/build-essential dependency in the final capsule
+    is a hard failure — it indicates the multi-stage Dockerfile is broken
+    and the image is not production-safe.
+    """
+    pass
+
 # --- System & Environment ---
 class EnvError(HamiltonError):
     """
