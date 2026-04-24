@@ -17,6 +17,26 @@ Three principles guide every design decision:
 
 ---
 
+## Why "Hamilton"?
+
+During the Apollo 11 moon landing, the Lunar Module's guidance computer was overloaded with rendezvous radar data. Margaret Hamilton's software saved the mission by shedding low-priority tasks and protecting the critical flight path.
+
+Hamilton-Ops applies the same principle: when P1 validation detects a regression, low-priority streams are killed immediately. We don't just build faster — we build with the same priority discipline that got humans to the moon.
+
+---
+
+## Technical Stack
+
+| Component | Technology | Hardening |
+|---|---|---|
+| Orchestrator | Python 3.10+ | `asyncio` + `os.setsid` process isolation |
+| Sandbox | Docker (Rootless) | Read-only Alpine containers for linting |
+| Cache | BuildKit Mounts | Namespaced via `$PROJECT_HASH` |
+| Audit | Syft / Cosign | SBOM generation and binary signing |
+| Validation | k6 | Network-restricted (localhost-only) |
+
+---
+
 ## Core Innovation: Out-of-Band Security
 
 Traditional pipelines build first and check later. Hamilton-Ops runs **parallel validation streams** that operate independently of the main build — auditing the software supply chain in real time, detecting secret leaks and cache poisoning, and blocking compromised builds **before image tagging**.
@@ -71,18 +91,6 @@ Resource guardrails detect CPU cores dynamically and cap Docker memory usage (de
 
 ---
 
-## Technical Stack
-
-| Component | Technology | Hardening |
-|---|---|---|
-| Orchestrator | Python 3.10+ | `asyncio` + `os.setsid` process isolation |
-| Sandbox | Docker (Rootless) | Read-only Alpine containers for linting |
-| Cache | BuildKit Mounts | Namespaced via `$PROJECT_HASH` |
-| Audit | Syft / Cosign | SBOM generation and binary signing |
-| Validation | k6 | Network-restricted (localhost-only) |
-
----
-
 ## CLI
 
 ```bash
@@ -113,13 +121,11 @@ The State Machine (`core/state.py`) requires **100% branch coverage**. This guar
 
 ---
 
-## Why "Hamilton"?
+## Documentation
 
-During the Apollo 11 moon landing, the Lunar Module's guidance computer was overloaded with rendezvous radar data. Margaret Hamilton's software saved the mission by shedding low-priority tasks and protecting the critical flight path.
-
-Hamilton-Ops applies the same principle: when P1 validation detects a regression, low-priority streams are killed immediately. We don't just build faster — we build with the same priority discipline that got humans to the moon.
-
----
+| Document | Description |
+|---|---|
+| [Glossary](docs/glossary.md) | Definitions for domain-specific and uncommon terms used in the codebase |
 
 ## License
 
