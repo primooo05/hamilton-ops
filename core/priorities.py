@@ -28,8 +28,11 @@ class Priority(Enum):
 @dataclass(frozen=True)
 class FlightThresholds:
     """
-    Telemetry threshold for the P1 Validation stream.
-    Frozen to ensure immutability during flight.
+    Read-only P1 telemetry thresholds loaded from .hamilton.toml.
+    Frozen post-construction to prevent mid-flight mutation.
+
+    Defaults match the baseline in the Hamilton-Ops specification:
+        p95_ms=200, p99_ms=500, error_rate_percent=1.0
     """
     p95_ms: int = 200
     p99_ms: int = 500

@@ -31,6 +31,11 @@ class StagingContext:
         1. Validates source existence.
         2. Clears stale staging data.
         3. Executes a non-symlink copy of the source.
+        --------------------------------------------
+        Definition of Terms:
+        A Symlink (Symbolic Link) is essentially
+        a "shortcut" or a "pointer"
+        to another file or directory on your computer.
         """
         async with self._lock:
             if not self.source_path.is_dir():
@@ -58,6 +63,12 @@ class StagingContext:
         """
         Ensures idempotent cleanup of the staging area.
         Reaps any zombie artifacts if the flight is aborted.
+        ----------------------------------------------------
+        Definition of Terms:
+        Zombie: refers to a process or resource that has completed
+        its task or been "killed," but its entry remains in
+        the system's table because it hasn't been properly reaped
+        or cleaned up.
         """
         async with self._lock:
             await self._clear_stage()
