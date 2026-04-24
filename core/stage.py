@@ -39,8 +39,6 @@ class StagingContext:
             await self._clear_stage()
 
             try:
-                # shutil is blocking — offload to thread
-                # use functools.partial to satisfy PyCharm type hinter for asyncio.to_thread
                 await asyncio.to_thread(
                     partial(
                         shutil.copytree,

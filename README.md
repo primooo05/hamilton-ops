@@ -1,164 +1,128 @@
-```md
-# Hamilton-Ops (v2.0 — Secure Edition)
+# Hamilton-Ops
+> *Speed follows precision. Security comes first.*
 
-**Tagline**  
-*A deterministic, security-hardened CI/CD orchestrator for polyglot systems.*
-
----
-
-## I. Project Description
-
-**Hamilton-Ops** is built on a simple premise:  
-> Speed follows precision. Security comes first.
-
-Unlike traditional CI/CD pipelines that assume a trusted local environment, Hamilton-Ops treats the developer machine as **hostile by default**. Every build is isolated, audited, and sanitized before it is allowed to become a production artifact.
-
-### Core Philosophy
-- **Isolation over convenience**
-- **Determinism over speed**
-- **Auditability over assumption**
+A deterministic, security-hardened CI/CD orchestrator for polyglot systems.
 
 ---
 
-## II. Core Innovation: Out-of-Band Security
+## What is Hamilton-Ops?
 
-Hamilton-Ops introduces **parallel validation streams** that operate independently of the main build pipeline.
+Hamilton-Ops treats the developer machine as **hostile by default**. Every build is isolated, audited, and sanitized before it is allowed to become a production artifact.
 
-Instead of simply building code, it:
-- Audits the **software supply chain in real time**
-- Detects **secret leaks, cache poisoning, and tool leakage**
-- Blocks compromised builds **before image tagging**
+Three principles guide every design decision:
+
+- **Isolation over convenience** — sandboxed streams, no shared state
+- **Determinism over speed** — predictable outcomes before fast outcomes
+- **Auditability over assumption** — every artifact is verified, not trusted
 
 ---
 
-## III. System Design: Hardened Architecture
+## Core Innovation: Out-of-Band Security
 
-### 1. Orchestration Layer ("Flight Computer")
+Traditional pipelines build first and check later. Hamilton-Ops runs **parallel validation streams** that operate independently of the main build — auditing the software supply chain in real time, detecting secret leaks and cache poisoning, and blocking compromised builds **before image tagging**.
+
+---
+
+## Architecture
+
+### The Flight Computer (Orchestration Layer)
 
 The Python dispatcher acts as a **Supervisor**, not just a subprocess manager.
 
-#### Process Group Isolation
-- Each child process runs under a unique session (`os.setsid`)
-- A single `SIGTERM` kills the entire process tree
-- Prevents zombie processes (e.g., k6 helpers)
-
-#### Sandbox Execution
-- Quality/Linting stream runs inside **minimal containers**
-- Prevents arbitrary code execution from malicious plugins
+Each child process runs under a unique session via `os.setsid`, meaning a single `SIGTERM` kills the entire process tree — no zombies, no orphaned k6 helpers. The Quality/Linting stream runs inside minimal read-only containers to prevent arbitrary code execution from malicious plugins.
 
 ---
 
-### 2. Pillar A: Hardened Immutable Staging
+### Pillar A — Hardened Immutable Staging
 
 Before any build begins, the staging environment is sanitized.
 
-#### Secret Scan (Pre-Flight)
-- Uses **gitleaks logic**
-- Detects `.env`, `.pem`, and sensitive files
-- Hard-blocks the build if secrets are found
-
-#### Symlink Guard
-- Uses `shutil.copytree(symlinks=False)`
-- Prevents path traversal attacks (e.g., `/etc/passwd` leaks)
+A pre-flight **secret scan** (via gitleaks logic) detects `.env`, `.pem`, and other sensitive files and hard-blocks the build if anything is found. A **symlink guard** using `shutil.copytree(symlinks=False)` prevents path traversal attacks that could expose host files like `/etc/passwd`.
 
 ---
 
-### 3. Pillar C: Safety State Machine (Priority Logic)
+### Pillar B — Safety State Machine
 
-The **Guidance System** that controls execution safety.
+The guidance system that controls execution safety across three priority streams:
 
-#### P1 Validation ("Radar")
-- Runs `k6` with `TARGET=localhost`
-- Blocks outbound traffic to private IP ranges
-- Prevents accidental DDoS during builds
+| Priority | Stream | Behavior on Failure |
+|---|---|---|
+| P1 | Validation (k6) | Hamilton Kill — terminates everything |
+| P2 | Quality (Linter) | Warn and continue unless `--strict` |
+| P3 | Construction (Docker) | Abort stream, others unaffected |
 
-#### The "Hamilton Kill"
-On failure:
-- Terminates all running processes
-- Cleans staging environment
-- Purges temporary containers
-- Generates forensic logs
+**The Hamilton Kill** — when P1 trips, the system terminates all running processes, cleans the staging environment, purges temporary containers, and generates forensic logs. k6 runs with `TARGET=localhost` and blocks outbound traffic to private IP ranges to prevent accidental DDoS during builds.
 
 ---
 
-### 4. Pillar D: Binary Audit (Clean Capsule Enforcement)
+### Pillar C — Binary Audit (Clean Capsule Enforcement)
 
-Ensures the final artifact is production-safe.
+Ensures the final artifact is production-safe through a chain of verifications.
 
-#### Extraction
-- Pulls compiled binaries from builder stage
-- Verifies via **SHA256 checksum**
-- Marks artifacts as **read-only**
-
-#### Zero-Tooling Verification
-- Scans final image for build tools (`gcc`, `mvn`, `npm`)
-- Fails if any tooling is present
-
-#### SBOM Generation
-- Generates a **Software Bill of Materials**
-- Flags `dev` or `build-essential` dependencies
+Compiled binaries are extracted from the builder stage, verified via **SHA256 checksum**, and marked read-only. The final image is then scanned for leaked build tools (`gcc`, `mvn`, `npm`) — any presence fails the build. A **Software Bill of Materials** is generated via Syft, flagging any `dev` or `build-essential` dependencies that survived into the production image.
 
 ---
 
-### 5. Pillar E: Sanitized Logging & Resource Guardrails
+### Pillar D — Sanitized Logging & Resource Guardrails
 
-#### Log Redaction
-- Regex-based sanitizer on all subprocess output
-- Automatically redacts secrets (e.g., API keys, AWS tokens)
+All subprocess output passes through a regex-based sanitizer that automatically redacts secrets (API keys, AWS tokens, etc.) before they reach the terminal or log files.
 
-#### Resource Guardrails
-- Detects CPU cores dynamically
-- Limits Docker memory usage (e.g., 4GB)
-- Prevents system slowdowns during builds
+Resource guardrails detect CPU cores dynamically and cap Docker memory usage (default: 4GB) to prevent build thrash from degrading the host machine.
 
 ---
 
-## IV. Technical Specifications
+## Technical Stack
 
-| Component     | Technology         | Hardening Feature                                      |
-|--------------|-------------------|--------------------------------------------------------|
-| Orchestrator | Python 3.10+      | `asyncio` + `os.setsid` process isolation              |
-| Sandbox      | Docker (Rootless) | Read-only Alpine containers for linting                |
-| Cache        | BuildKit Mounts   | Namespaced via `$PROJECT_HASH`                         |
-| Audit        | Syft / Cosign     | SBOM generation and binary signing                     |
-| Validation   | k6                | Network-restricted (localhost-only execution)          |
+| Component | Technology | Hardening |
+|---|---|---|
+| Orchestrator | Python 3.10+ | `asyncio` + `os.setsid` process isolation |
+| Sandbox | Docker (Rootless) | Read-only Alpine containers for linting |
+| Cache | BuildKit Mounts | Namespaced via `$PROJECT_HASH` |
+| Audit | Syft / Cosign | SBOM generation and binary signing |
+| Validation | k6 | Network-restricted (localhost-only) |
 
 ---
 
-## V. Success Criteria
+## CLI
+
+```bash
+# Verify your build environment
+hamilton doctor
+
+# Run a full parallel build
+hamilton ship --project <name>
+
+# Post-build artifact verification
+hamilton audit
+```
 
 ### `hamilton doctor`
-Diagnostic tool that fails when:
-- Docker daemon runs as root
-- Tool versions drift from `.lock` files
-
----
+Fails if the Docker daemon is running as root or if tool versions have drifted from `.lock` files.
 
 ### `hamilton audit`
-Post-deployment verification report:
-
-- **0 secrets detected**
-- **0 build tools leaked into production**
-- **Verified SHA256 checksum of binary capsule**
-
----
-
-### Test Coverage
-
-- **100% coverage on the State Machine**
-- Ensures:
-  - Deterministic behavior
-  - No race conditions
-  - Reliable kill-switch execution
+Produces a verification report. A clean build produces:
+- 0 secrets detected
+- 0 build tools leaked into production
+- Verified SHA256 checksum of binary capsule
 
 ---
 
-## Summary
+## Test Coverage
 
-Hamilton-Ops is not just a CI/CD tool—  
-it is a **security-first build system** that guarantees every artifact is:
+The State Machine (`core/state.py`) requires **100% branch coverage**. This guarantees deterministic failure handling, no race conditions, and reliable kill-switch execution under every condition.
 
-- **Clean**
-- **Verified**
-- **Production-safe**
-```
+---
+
+## Why "Hamilton"?
+
+During the Apollo 11 moon landing, the Lunar Module's guidance computer was overloaded with rendezvous radar data. Margaret Hamilton's software saved the mission by shedding low-priority tasks and protecting the critical flight path.
+
+Hamilton-Ops applies the same principle: when P1 validation detects a regression, low-priority streams are killed immediately. We don't just build faster — we build with the same priority discipline that got humans to the moon.
+
+---
+
+## License
+
+MIT — See `LICENSE` for details.
+
+*Inspired by Margaret Hamilton, gitleaks, Syft, Cosign, and the k6 team.*
