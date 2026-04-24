@@ -67,10 +67,6 @@ class DockerDriver:
         self.dockerfile = Path(dockerfile).resolve() if dockerfile else self.stage_path / "Dockerfile"
         self.no_cache   = no_cache
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
     def run(self) -> DriverResult:
         """
         Execute ``docker build`` against the staging directory.
@@ -186,10 +182,6 @@ class DockerDriver:
             f"docker build failed with exit code {code}: {stderr.strip()}",
             context={"exit_code": code, "stderr": stderr},
         )
-
-    # ------------------------------------------------------------------
-    # Subprocess injection point
-    # ------------------------------------------------------------------
 
     def _run_subprocess(self, cmd: list[str]) -> subprocess.CompletedProcess:
         """
