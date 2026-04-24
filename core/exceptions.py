@@ -97,4 +97,27 @@ class StagingError(HamiltonError):
     """
     pass
 
+class DriverNotFoundError(HamiltonError):
+    """
+    Registry Lookup Failure.
+
+    Raised by DriverRegistry.get() when a requested tool name
+    does not exist in the phonebook. Provides a deterministic
+    failure instead of a raw Python KeyError, enabling the
+    Supervisor to emit a meaningful telemetry signal.
+    """
+    pass
+
+
+class RegistryError(HamiltonError):
+    """
+    Registry Integrity Violation.
+
+    Raised when code attempts to overwrite an already-registered
+    driver. Enforces the 'No-Hijack' rule: once a driver is locked
+    into the Registry, it cannot be replaced at runtime — preventing
+    hostile injection of malicious functions into the toolchain.
+    """
+    pass
+
 
