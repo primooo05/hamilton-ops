@@ -10,15 +10,23 @@ import sys
 import time
 import subprocess
 import tempfile
+import logging
 from pathlib import Path
 
 # Ensure project root is on the path (go up from tests/drivers/test_construction/)
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from drivers.construction import ConstructionDriver
-
-
 from core.exceptions import BuildError
+
+# --- Logging Configuration ---
+# Configure a clean output for the manual verification script.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-8s | %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger("hamilton.test.p1_alarm")
 
 class SimulatedBuildDriver(ConstructionDriver):
     """Overrides _build_popen to spawn a multi-process dummy build."""
@@ -30,7 +38,7 @@ class SimulatedBuildDriver(ConstructionDriver):
         if self.child_pid_file.exists():
             self.child_pid_file.unlink()
             
-        print(f"  [SIM] Spawning dummy multi-process build (Parent + Child)...")
+        logger.info("[SIM] Spawning dummy multi-process build (Parent + Child)...")
         # Child writes its PID to a file then sleeps.
         child_script = (
             "import os, time; "
@@ -73,9 +81,9 @@ def is_process_alive(pid):
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Hamilton-Ops — Manual P1 Alarm Verification")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Hamilton-Ops — Manual P1 Alarm Verification")
+    logger.info("=" * 60)
 
     # Use a real temp directory for the stage path to avoid resolution warnings
     with tempfile.TemporaryDirectory() as tmp_stage:
@@ -85,52 +93,52 @@ if __name__ == "__main__":
 
         def trigger_alarm_after(seconds):
             time.sleep(seconds)
-            print(f"\n  [P1 ALARM] HamiltonAlarm fired after {seconds}s! Calling terminate()...")
+            logger.warning("[P1 ALARM] HamiltonAlarm fired after %ds! Calling terminate()...", seconds)
             driver.terminate()
 
         # Fire the P1 alarm after 2 seconds
         alarm_thread = threading.Thread(target=trigger_alarm_after, args=(2,))
         alarm_thread.start()
 
-        print("\n  [CONSTRUCTION] run() started — multi-process dummy build running...")
+        logger.info("[CONSTRUCTION] run() started — multi-process dummy build running...")
         start = time.monotonic()
         caught_build_error = False
         aborted_flag = False
 
         try:
             driver.run()
-            print("  [CONSTRUCTION] Build completed normally (unexpected in this test).")
+            logger.info("[CONSTRUCTION] Build completed normally (unexpected in this test).")
         except BuildError as exc:
             elapsed = time.monotonic() - start
             caught_build_error = True
             aborted_flag = exc.context.get("aborted", False)
-            print(f"\n  [CONSTRUCTION] Caught BuildError as expected after {elapsed:.2f}s.")
-            print(f"  [CONSTRUCTION] Context: {exc.context}")
+            logger.info("[CONSTRUCTION] Caught BuildError as expected after %.2fs.", elapsed)
+            logger.info("[CONSTRUCTION] Context: %s", exc.context)
         except Exception as exc:
-            print(f"\n  [ERROR] Caught unexpected exception type: {type(exc).__name__}: {exc}")
+            logger.error("[ERROR] Caught unexpected exception type: %s: %s", type(exc).__name__, exc)
 
         alarm_thread.join()
 
         # Validation logic
-        print("-" * 60)
+        logger.info("-" * 60)
         success = True
         
         if not caught_build_error:
-            print("FAIL: Expected BuildError was not raised.")
+            logger.error("FAIL: Expected BuildError was not raised.")
             success = False
         
         if not aborted_flag:
-            print("FAIL: BuildError context missing 'aborted': True.")
+            logger.error("FAIL: BuildError context missing 'aborted': True.")
             success = False
             
         # The build should stop around 2s (SIGTERM) or up to 7s (SIGKILL escalation)
         elapsed = time.monotonic() - start
         if elapsed > 15:
-            print(f"FAIL: Build took too long to terminate ({elapsed:.2f}s). Escalation failed?")
+            logger.error("FAIL: Build took too long to terminate (%.2fs). Escalation failed?", elapsed)
             success = False
 
         if driver._proc is not None:
-            print("FAIL: driver._proc was not cleared after terminate().")
+            logger.error("FAIL: driver._proc was not cleared after terminate().")
             success = False
 
         # --- Surgical Reaping Check (Multi-process) ---
@@ -142,21 +150,23 @@ if __name__ == "__main__":
             if hasattr(os, "killpg"):
                 # POSIX: Surgical reaping must kill the entire group
                 if child_alive:
-                    print(f"FAIL: Surgical reaping failed — Child PID {child_pid} is still alive.")
+                    logger.error("FAIL: Surgical reaping failed — Child PID %d is still alive.", child_pid)
                     success = False
                 else:
-                    print(f"SUCCESS: Surgical reaping — Child PID {child_pid} was reaped.")
+                    logger.info("SUCCESS: Surgical reaping — Child PID %d was reaped.", child_pid)
             else:
                 # Windows: kill() only reaps parent
                 if child_alive:
-                    print(f"INFO: Windows fallback (kill) — Child PID {child_pid} remains (expected).")
+                    logger.info("INFO: Windows fallback (kill) — Child PID %d remains (expected).", child_pid)
                 else:
-                    print(f"SUCCESS: Child PID {child_pid} reaped (unexpected but welcome on Windows).")
+                    logger.info("SUCCESS: Child PID %d reaped (unexpected but welcome on Windows).", child_pid)
             
             driver.child_pid_file.unlink()
         else:
-            print("WARNING: Could not verify surgical reaping — Child PID file not found.")
+            logger.warning("WARNING: Could not verify surgical reaping — Child PID file not found.")
 
-        print("\nRESULT: P1 Alarm Reaping " + ("SUCCESS [OK]" if success else "FAILED [FAIL]"))
-        print("=" * 60)
+        result_msg = "SUCCESS [OK]" if success else "FAILED [FAIL]"
+        logger.info("RESULT: P1 Alarm Reaping %s", result_msg)
+        logger.info("=" * 60)
+
 
