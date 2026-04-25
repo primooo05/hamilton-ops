@@ -61,7 +61,10 @@ class LinterDriver:
                         Defaults to ``["flake8"]``.
         """
         self.stage_path = Path(stage_path).resolve()
-        self.tool_cmd   = tool_cmd or list(_DEFAULT_LINTER_CMD)
+        # Defensive copy: whether tool_cmd was provided or defaulted, the driver
+        # must own its list so that caller mutations after construction and
+        # mutations to _DEFAULT_LINTER_CMD are both isolated from each other.
+        self.tool_cmd   = list(tool_cmd) if tool_cmd else list(_DEFAULT_LINTER_CMD)
 
     def run(self) -> DriverResult:
         """
@@ -88,7 +91,7 @@ class LinterDriver:
         Verify that the configured linter binary is available on PATH.
 
         Raises:
-            EnvError: If the binary is not found.
+            EnvError: If the binary is not found or --version returns non-zero.
         """
         binary = self.tool_cmd[0]
         if not shutil.which(binary):
@@ -99,7 +102,23 @@ class LinterDriver:
             )
         # Run with --version (works for flake8, eslint, ruff, etc.)
         completed = self._run_subprocess([binary, "--version"])
-        version = completed.stdout.strip().splitlines()[0] if completed.stdout else "unknown"
+
+        # a non-zero exit from --version means the binary is broken
+        # or the wrong binary is on PATH — surface this as an EnvError rather
+        # than silently returning a stale or empty version string.
+        if completed.returncode != 0:
+            raise EnvError(
+                f"Linter binary '{binary}' --version check failed (exit {completed.returncode}): "
+                f"{completed.stderr.strip()}",
+                context={"tool": binary, "exit_code": completed.returncode},
+            )
+
+        # .strip() on whitespace-only stdout yields "", whose
+        # .splitlines() is [], so [][0] raises IndexError.  Guard with `lines[0]
+        # if lines else "unknown"` to degrade safely.
+        stripped = completed.stdout.strip() if completed.stdout else ""
+        lines = stripped.splitlines()
+        version = lines[0] if lines else "unknown"
         return DriverResult(success=True, output={"version": version})
 
     def _build_command(self) -> list[str]:
@@ -116,14 +135,26 @@ class LinterDriver:
         Translate a non-zero linter exit code into the correct Hamilton signal.
 
         Raises:
-            EnvError:        On exit 127 (binary not found at runtime).
+            EnvError:         On exit 127 (binary not found at runtime).
             QualityViolation: On all other non-zero exits (hygiene issues).
+
+        Note:
+            Bug 2 fix: callers must never invoke this with code=0 (the run()
+            method guards this), but if they do, returning early is safer than
+            accidentally raising a QualityViolation for a clean run.
         """
+        # early-return guard so a misrouted exit=0 call never
+        # produces a spurious QualityViolation signal.
+        if code == 0:
+            return
+
         if code == _EXIT_NOT_FOUND:
             raise EnvError(
                 f"Linter binary '{self.tool_cmd[0]}' not found during execution (exit 127). "
                 "Pre-flight health check should have caught this.",
-                context={"exit_code": code, "tool": self.tool_cmd[0]},
+                # include stderr so the Supervisor can log the raw
+                # shell error message without a separate subprocess capture.
+                context={"exit_code": code, "tool": self.tool_cmd[0], "stderr": stderr},
             )
         # Count violations from stdout (linters typically emit one line per issue)
         violation_count = len([l for l in stdout.splitlines() if l.strip()])
@@ -135,6 +166,10 @@ class LinterDriver:
                 "tool": self.tool_cmd[0],
                 "violations": violation_count,
                 "output": stdout,
+                # surface stderr alongside stdout so that linters
+                # which write diagnostics to stderr (e.g. eslint parse errors)
+                # are not silently discarded.
+                "stderr": stderr,
             },
         )
 
