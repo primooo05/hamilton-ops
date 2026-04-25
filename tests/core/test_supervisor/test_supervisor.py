@@ -80,6 +80,14 @@ class _FakeDriver:
         self.terminate_called = True
 
 
+class _FakeAsyncDriver(_FakeDriver):
+    """Async variant for ConstructionDriver which uses asyncio natively."""
+    async def run(self):
+        await asyncio.sleep(10)
+        return super().run()
+        
+    async def terminate(self):
+        super().terminate()
 class _FakeRegistry:
     """
     Minimal registry stand-in that maps name → driver instance.
@@ -137,6 +145,9 @@ def bypass_staging(tmp_path):
     Patch StagingContext so unit tests never touch the real filesystem snapshot.
     Returns the tmp_path as the "stage_path" so drivers receive a valid Path.
     """
+    # Create a dummy Dockerfile to satisfy ConstructionDriver's pre-flight check
+    (tmp_path / "Dockerfile").touch()
+
     class _FakeStagingCtx:
         def __init__(self, source_path):
             self.source_path = source_path
@@ -242,12 +253,13 @@ async def test_p1_alarm_cancels_p3_but_logs_correctly(tmp_path, bypass_staging):
     must not report "P3 failed with BuildError" when it was P1 that killed it.
     """
     alarm = HamiltonAlarm("P95 spiked")
-    p3_driver = _FakeDriver()  # P3 won't even get to run properly
+    p3_driver = _FakeAsyncDriver()  # P3 won't even get to run properly
 
     config = _make_config(tmp_path)
     sv = _make_supervisor(config, k6=_FakeDriver(raises=alarm), docker=p3_driver)
 
-    report = await sv.ship()
+    with patch("core.supervisor.ConstructionDriver", return_value=p3_driver):
+        report = await sv.ship()
 
     p3 = report.stream_results.get("P3:Construction")
     if p3 is not None:
@@ -273,7 +285,7 @@ async def test_p1_alarm_calls_terminate_on_construction_driver(tmp_path, bypass_
     to reap the BuildKit process tree. If this test fails, Docker zombies survive.
     """
     alarm = HamiltonAlarm("Error rate spike")
-    p3_driver = _FakeDriver()
+    p3_driver = _FakeAsyncDriver()
 
     config = _make_config(tmp_path)
     sv = _make_supervisor(config, k6=_FakeDriver(raises=alarm), docker=p3_driver)
@@ -363,9 +375,9 @@ async def test_p3_build_error_does_not_abort_mission(tmp_path, bypass_staging):
     build_err = BuildError("Dockerfile syntax error on line 12")
 
     config = _make_config(tmp_path)
-    sv = _make_supervisor(config, docker=_FakeDriver(raises=build_err))
+    sv = _make_supervisor(config, docker=_FakeAsyncDriver(raises=build_err))
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver(raises=build_err)):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver(raises=build_err)):
         report = await sv.ship()
 
     # Mission is not fully ABORTED — P3 was the only casualty.
@@ -382,9 +394,9 @@ async def test_p3_build_error_records_failed_outcome_in_forensics(tmp_path, bypa
     build_err = BuildError("OOM during build")
 
     config = _make_config(tmp_path)
-    sv = _make_supervisor(config, docker=_FakeDriver(raises=build_err))
+    sv = _make_supervisor(config, docker=_FakeAsyncDriver(raises=build_err))
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver(raises=build_err)):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver(raises=build_err)):
         report = await sv.ship()
 
     p3 = report.stream_results.get("P3:Construction")

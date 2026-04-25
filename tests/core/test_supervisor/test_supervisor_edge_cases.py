@@ -60,6 +60,16 @@ class _FakeDriver:
         self.terminate_called = True
 
 
+class _FakeAsyncDriver(_FakeDriver):
+    """Async variant for ConstructionDriver which uses asyncio natively."""
+    async def run(self):
+        # Sleep to simulate long-running process, allowing cancellation
+        await asyncio.sleep(0.01)
+        return super().run()
+        
+    async def terminate(self):
+        super().terminate()
+
 class _FakeRegistry:
     def __init__(self, drivers: dict):
         self._drivers = drivers
@@ -159,12 +169,12 @@ async def test_ship_called_twice_does_not_crash(tmp_path, bypass_staging):
     registry = _FakeRegistry({
         "k6": _FakeDriver(),
         "linter": _FakeDriver(),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver()):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
         report1 = await sv.ship()
         # Reset kill_fired so second call behaves as a fresh run
         sv._kill_fired = False
@@ -186,11 +196,11 @@ async def test_all_streams_fail_simultaneously(tmp_path, bypass_staging):
     registry = _FakeRegistry({
         "k6": _FakeDriver(raises=HamiltonAlarm("P1 failure")),
         "linter": _FakeDriver(raises=QualityViolation("P2 failure")),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver()):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
         report = await sv.ship()
 
     # System must settle — either ABORTED or some terminal state.
@@ -214,7 +224,7 @@ async def test_hamilton_kill_safe_when_no_construction_driver(tmp_path):
     registry = _FakeRegistry({
         "k6": _FakeDriver(),
         "linter": _FakeDriver(),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
     assert sv._construction_driver is None
@@ -240,7 +250,7 @@ async def test_cleanup_failure_sets_cleanup_ok_false(tmp_path, bypass_staging):
     registry = _FakeRegistry({
         "k6": _FakeDriver(),
         "linter": _FakeDriver(),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
@@ -273,12 +283,12 @@ async def test_p1_telemetry_stored_in_forensic_report(tmp_path, bypass_staging):
     registry = _FakeRegistry({
         "k6": _FakeDriver(result=k6_result),
         "linter": _FakeDriver(),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver()):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
         report = await sv.ship()
 
     assert report.p1_metrics == fake_metrics
@@ -300,12 +310,12 @@ async def test_stream_duration_is_positive_after_run(tmp_path, bypass_staging):
     registry = _FakeRegistry({
         "k6": _FakeDriver(),
         "linter": _FakeDriver(),
-        "docker": _FakeDriver(),
+        "docker": _FakeAsyncDriver(),
     })
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeDriver()):
+    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
         report = await sv.ship()
 
     for name, result in report.stream_results.items():

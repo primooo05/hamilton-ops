@@ -30,26 +30,34 @@ def _make_driver(stage="/tmp/stage", tag="myapp:v1", **kwargs) -> ConstructionDr
     return ConstructionDriver(stage_path=stage, image_tag=tag, **kwargs)
 
 
-class MockPopen:
+class AsyncMockProcess:
     """
-    Lightweight fake for subprocess.Popen.
+    Lightweight fake for asyncio.subprocess.Process.
     """
-    def __init__(self, returncode=0, stdout="", stderr="", pid=9999):
+    def __init__(self, returncode=0, stdout_lines=None, pid=9999):
         self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
+        self._stdout_lines = stdout_lines or []
         self.pid = pid
         self.killed = False
-        self._poll_value = returncode
 
-    def communicate(self):
-        return self._stdout, self._stderr
+        async def _async_gen():
+            for line in self._stdout_lines:
+                yield (line + "\n").encode()
 
-    def poll(self):
-        return self._poll_value
+        self.stdout = _async_gen()
+
+    async def wait(self):
+        return self.returncode
 
     def kill(self):
         self.killed = True
+
+
+def _make_async_popen(returncode=0, stdout_lines=None, pid=9999):
+    """Return an async factory that yields an AsyncMockProcess."""
+    async def _factory(cmd):
+        return AsyncMockProcess(returncode=returncode, stdout_lines=stdout_lines, pid=pid)
+    return _factory
 
 
 def _completed(returncode=0, stdout="", stderr="") -> subprocess.CompletedProcess:
@@ -63,7 +71,8 @@ def _docker_info_json(rootless: bool = True) -> str:
     return json.dumps({"SecurityOptions": options, "ServerVersion": "24.0.0"})
 
 
-def test_terminate_escalates_to_sigkill_when_sigterm_ignored():
+@pytest.mark.asyncio
+async def test_terminate_escalates_to_sigkill_when_sigterm_ignored():
     """
     GAP | terminate(): Escalation to SIGKILL when SIGTERM is ignored.
 
@@ -73,9 +82,9 @@ def test_terminate_escalates_to_sigkill_when_sigterm_ignored():
     import drivers.construction as construction_module
 
     driver = _make_driver()
-    mock_proc = MockPopen(pid=1234)
-    mock_proc._poll_value = None
-    mock_proc.poll = MagicMock(return_value=None)
+    mock_proc = AsyncMockProcess(pid=1234)
+    # returncode stays None — process never exits after SIGTERM
+    mock_proc.returncode = None
     driver._proc = mock_proc
 
     mock_os = MagicMock(spec=os)
@@ -83,9 +92,12 @@ def test_terminate_escalates_to_sigkill_when_sigterm_ignored():
     mock_os.killpg = MagicMock()
 
     with patch.object(construction_module, "os", mock_os), \
-         patch("drivers.construction.time.monotonic", side_effect=[0.0, 999.0, 999.0]), \
-         patch("drivers.construction.time.sleep"):
-        driver.terminate()
+         patch("drivers.construction.time.monotonic", side_effect=[0.0, 999.0, 999.0]):
+        # Stub asyncio.sleep as a no-op coroutine so the grace period passes instantly.
+        async def _instant_sleep(_s):
+            return
+        with patch.object(construction_module.asyncio, "sleep", _instant_sleep):
+            await driver.terminate()
 
     # SIGTERM first
     assert mock_os.killpg.call_args_list[0] == call(5678, signal.SIGTERM)
@@ -93,7 +105,8 @@ def test_terminate_escalates_to_sigkill_when_sigterm_ignored():
     assert mock_os.killpg.call_args_list[1] == call(5678, 9)
 
 
-def test_terminate_does_not_escalate_to_sigkill_when_process_exits_cleanly():
+@pytest.mark.asyncio
+async def test_terminate_does_not_escalate_to_sigkill_when_process_exits_cleanly():
     """
     GAP | terminate(): No SIGKILL if process exits after SIGTERM.
 
@@ -103,8 +116,8 @@ def test_terminate_does_not_escalate_to_sigkill_when_process_exits_cleanly():
     import drivers.construction as construction_module
 
     driver = _make_driver()
-    mock_proc = MockPopen(pid=1234)
-    mock_proc.poll = MagicMock(return_value=-15)
+    mock_proc = AsyncMockProcess(pid=1234)
+    mock_proc.returncode = -15  # already exited
     driver._proc = mock_proc
 
     mock_os = MagicMock(spec=os)
@@ -112,15 +125,15 @@ def test_terminate_does_not_escalate_to_sigkill_when_process_exits_cleanly():
     mock_os.killpg = MagicMock()
 
     with patch.object(construction_module, "os", mock_os), \
-         patch("drivers.construction.time.monotonic", return_value=0.0), \
-         patch("drivers.construction.time.sleep"):
-        driver.terminate()
+         patch("drivers.construction.time.monotonic", return_value=0.0):
+        await driver.terminate()
 
     for c in mock_os.killpg.call_args_list:
         assert c != call(5678, 9)
 
 
-def test_terminate_handles_process_lookup_error_race_condition():
+@pytest.mark.asyncio
+async def test_terminate_handles_process_lookup_error_race_condition():
     """
     GAP | terminate(): Handles ProcessLookupError (TOCTOU race).
 
@@ -130,7 +143,7 @@ def test_terminate_handles_process_lookup_error_race_condition():
     import drivers.construction as construction_module
 
     driver = _make_driver()
-    mock_proc = MockPopen(pid=1234)
+    mock_proc = AsyncMockProcess(pid=1234)
     driver._proc = mock_proc
 
     mock_os = MagicMock(spec=os)
@@ -138,7 +151,7 @@ def test_terminate_handles_process_lookup_error_race_condition():
     mock_os.killpg = MagicMock(side_effect=ProcessLookupError)
 
     with patch.object(construction_module, "os", mock_os):
-        driver.terminate()  # must not raise
+        await driver.terminate()  # must not raise
 
 
 @pytest.mark.parametrize("key,value", [
@@ -185,27 +198,33 @@ def test_redact_build_args_value_with_multiple_equals_signs():
 
 
 
-def test_terminate_clears_proc_reference_is_handled_by_run(tmp_path):
+@pytest.mark.asyncio
+async def test_terminate_clears_proc_reference_is_handled_by_run(tmp_path):
     """
     GAP | run(): _proc is cleared after successful build.
     """
-    driver = _make_driver(stage=str(tmp_path))
-    driver._build_popen = MagicMock(return_value=MockPopen(returncode=0, stdout="ok"))
-    driver.run()
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="myapp:v1")
+    driver._build_popen = _make_async_popen(returncode=0)
+    await driver.run()
     assert driver._proc is None
 
 
-def test_run_clears_proc_reference_after_build_failure():
+@pytest.mark.asyncio
+async def test_run_clears_proc_reference_after_build_failure(tmp_path):
     """
     GAP | run(): _proc is cleared after failed build.
     """
-    driver = _make_driver()
-    driver._build_popen = MagicMock(
-        return_value=MockPopen(returncode=1, stderr="COPY failed")
-    )
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="myapp:v1")
+    driver._build_popen = _make_async_popen(returncode=1, stdout_lines=["COPY failed"])
 
     with pytest.raises(BuildError):
-        driver.run()
+        await driver.run()
 
     assert driver._proc is None
 

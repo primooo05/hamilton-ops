@@ -4,7 +4,7 @@ Contract tests for drivers/construction.py
 Strategy: Test the translation logic (command construction, cache injection,
 secret/SSH flags, log redaction) and process lifecycle (terminate/signal)
 without launching a real Docker daemon. ``_build_popen`` is replaced at the
-instance level with a ``MockPopen`` object.
+instance level with an ``AsyncMockProcess`` / async factory.
 
 Test categories:
   1. Command construction — core flags
@@ -13,7 +13,7 @@ Test categories:
   4. BuildKit Secret & SSH Handover — --secret and --ssh flags
   5. Surgical Interrupt (Signal Handling) — terminate() process group kill
   6. Exit-code → exception mapping
-  7. Integration: run() with mocked Popen
+  7. Integration: run() with mocked async Popen
   8. Health Check — check_health() core paths
   9. _build_command() — --file flag and custom dockerfile
 """
@@ -35,30 +35,38 @@ def _make_driver(stage="/tmp/stage", tag="myapp:v1", **kwargs) -> ConstructionDr
     return ConstructionDriver(stage_path=stage, image_tag=tag, **kwargs)
 
 
-class MockPopen:
+class AsyncMockProcess:
     """
-    Lightweight fake for subprocess.Popen.
+    Lightweight fake for asyncio.subprocess.Process.
 
-    Supports communicate() returning (stdout, stderr), poll(), and kill().
+    Supports async iteration of stdout lines, returncode, pid, kill().
     ``pid`` is fixed to 9999 so tests can assert on it without spawning
     a real process.
     """
-    def __init__(self, returncode=0, stdout="", stderr="", pid=9999):
+    def __init__(self, returncode=0, stdout_lines=None, pid=9999):
         self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
+        self._stdout_lines = stdout_lines or []
         self.pid = pid
         self.killed = False
-        self._poll_value = returncode   # poll() returns this after communicate()
 
-    def communicate(self):
-        return self._stdout, self._stderr
+        async def _async_gen():
+            for line in self._stdout_lines:
+                yield (line + "\n").encode()
 
-    def poll(self):
-        return self._poll_value
+        self.stdout = _async_gen()
+
+    async def wait(self):
+        return self.returncode
 
     def kill(self):
         self.killed = True
+
+
+def _make_async_popen(returncode=0, stdout_lines=None, pid=9999):
+    """Return an async factory that yields an AsyncMockProcess."""
+    async def _factory(cmd):
+        return AsyncMockProcess(returncode=returncode, stdout_lines=stdout_lines, pid=pid)
+    return _factory
 
 
 def test_build_command_starts_with_docker_build():
@@ -301,7 +309,8 @@ def test_secret_uses_mount_syntax_not_env():
     assert not any("mytoken" in v for v in build_arg_values)
 
 
-def test_terminate_calls_killpg_on_posix():
+@pytest.mark.asyncio
+async def test_terminate_calls_killpg_on_posix():
     """
     Contract: terminate() must call os.killpg with SIGTERM when the OS
     supports process groups (POSIX). This kills the entire BuildKit tree,
@@ -314,8 +323,8 @@ def test_terminate_calls_killpg_on_posix():
     import drivers.construction as construction_module
 
     driver = _make_driver()
-    mock_proc = MockPopen(pid=1234)
-    mock_proc._poll_value = -15   # simulate process exiting after SIGTERM
+    mock_proc = AsyncMockProcess(pid=1234)
+    mock_proc.returncode = -15  # simulate process exiting after SIGTERM
     driver._proc = mock_proc
 
     # Stub os with killpg and getpgid present
@@ -324,14 +333,15 @@ def test_terminate_calls_killpg_on_posix():
     mock_os.killpg  = MagicMock()
 
     with patch.object(construction_module, "os", mock_os):
-        driver.terminate()
+        await driver.terminate()
 
     mock_os.getpgid.assert_called_with(1234)
     # SIGTERM must be sent to the process GROUP (5678), not just the PID
     mock_os.killpg.assert_any_call(5678, signal.SIGTERM)
 
 
-def test_terminate_is_noop_when_no_active_build():
+@pytest.mark.asyncio
+async def test_terminate_is_noop_when_no_active_build():
     """
     Contract: terminate() must not raise when called before run() or after
     the build has already completed. This makes it safe to call from the
@@ -339,21 +349,22 @@ def test_terminate_is_noop_when_no_active_build():
     """
     driver = _make_driver()
     assert driver._proc is None
-    driver.terminate()  # must not raise
+    await driver.terminate()  # must not raise
 
 
-def test_terminate_kills_process_on_windows_fallback():
+@pytest.mark.asyncio
+async def test_terminate_kills_process_on_windows_fallback():
     """
     Contract: On Windows (where os.killpg is absent), terminate() must
     fall back to Popen.kill() to abort the build process.
     """
     driver = _make_driver()
-    mock_proc = MockPopen(pid=4321)
+    mock_proc = AsyncMockProcess(pid=4321)
     driver._proc = mock_proc
 
     # Simulate a Windows environment where os.killpg does not exist
     with patch("drivers.construction.hasattr", return_value=False):
-        driver.terminate()
+        await driver.terminate()
 
     assert mock_proc.killed is True
 
@@ -399,76 +410,88 @@ def test_map_exit_code_1_raises_generic_build_error():
 
 
 
-def test_run_returns_driver_result_on_success():
+@pytest.mark.asyncio
+async def test_run_returns_driver_result_on_success(tmp_path):
     """
     Contract: run() must return DriverResult(success=True) with image_tag
     in the output when docker build exits 0.
     """
-    driver = _make_driver(tag="myapp:v1.0.0")
-    driver._build_popen = MagicMock(
-        return_value=MockPopen(returncode=0, stdout="Successfully built abc123")
-    )
-    result = driver.run()
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="myapp:v1.0.0")
+    driver._build_popen = _make_async_popen(returncode=0, stdout_lines=["Successfully built abc123"])
+    result = await driver.run()
 
     assert result.success is True
     assert result.output["image_tag"] == "myapp:v1.0.0"
 
 
-def test_run_raises_build_error_on_nonzero_exit():
+@pytest.mark.asyncio
+async def test_run_raises_build_error_on_nonzero_exit(tmp_path):
     """
     Contract: run() must raise BuildError (not return a failed DriverResult)
     when docker build exits non-zero — the P3 stream is aborted.
     """
-    driver = _make_driver()
-    driver._build_popen = MagicMock(
-        return_value=MockPopen(returncode=1, stderr="COPY failed: no such file")
-    )
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="app:v1")
+    driver._build_popen = _make_async_popen(returncode=1, stdout_lines=["COPY failed: no such file"])
     with pytest.raises(BuildError):
-        driver.run()
+        await driver.run()
 
 
-def test_run_raises_build_error_with_oom_context_on_exit_137():
+@pytest.mark.asyncio
+async def test_run_raises_build_error_with_oom_context_on_exit_137(tmp_path):
     """
     Contract: run() must raise BuildError with oom=True when OOM-killed.
     """
-    driver = _make_driver()
-    driver._build_popen = MagicMock(
-        return_value=MockPopen(returncode=137, stderr="Killed")
-    )
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="app:v1")
+    driver._build_popen = _make_async_popen(returncode=137)
     with pytest.raises(BuildError) as exc_info:
-        driver.run()
+        await driver.run()
     assert exc_info.value.context["oom"] is True
 
 
-def test_run_raises_build_error_with_aborted_on_sigterm():
+@pytest.mark.asyncio
+async def test_run_raises_build_error_with_aborted_on_sigterm(tmp_path):
     """
     Contract: run() must raise BuildError with aborted=True when the process
     is killed by a signal (negative exit code — P1 Abort scenario).
     """
-    driver = _make_driver()
-    driver._build_popen = MagicMock(
-        return_value=MockPopen(returncode=-15, stderr="")
-    )
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="app:v1")
+    driver._build_popen = _make_async_popen(returncode=-15)
     with pytest.raises(BuildError) as exc_info:
-        driver.run()
+        await driver.run()
     assert exc_info.value.context["aborted"] is True
 
 
-def test_run_passes_full_command_to_popen_not_redacted():
+@pytest.mark.asyncio
+async def test_run_passes_full_command_to_popen_not_redacted(tmp_path):
     """
     Contract: run() must pass the REAL command (with secrets) to _build_popen
     — only the logged representation is redacted. The build itself needs the
     actual values.
     """
-    driver = _make_driver(project_hash="abc123")
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="app:v1", project_hash="abc123")
     captured_cmds: list[list[str]] = []
 
-    def fake_popen(cmd):
+    async def fake_popen(cmd):
         captured_cmds.append(cmd)
-        return MockPopen(returncode=0, stdout="ok")
+        return AsyncMockProcess(returncode=0)
 
     driver._build_popen = fake_popen
-    driver.run()
+    await driver.run()
 
     # The real CACHE_ID value must reach Popen
     full_cmd = captured_cmds[0]

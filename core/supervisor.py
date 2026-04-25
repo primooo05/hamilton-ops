@@ -59,6 +59,45 @@ from audit.chain import (
 # Module-level import so tests can patch "core.supervisor.ConstructionDriver".
 from drivers.construction import ConstructionDriver
 
+# --- Python 3.10 Compatibility Layer ---
+import sys
+
+if sys.version_info >= (3, 11):
+    from asyncio import TaskGroup
+    _ExceptionGroup = (ExceptionGroup, BaseExceptionGroup)
+else:
+    # Use standard Exception as a catch-all if ExceptionGroup isn't available
+    try:
+        from exceptiongroup import ExceptionGroup, BaseExceptionGroup
+        _ExceptionGroup = (ExceptionGroup, BaseExceptionGroup)
+    except ImportError:
+        class ExceptionGroup(Exception):
+            """Fallback for ExceptionGroup."""
+            def __init__(self, message, exceptions):
+                super().__init__(message)
+                self.exceptions = exceptions
+        _ExceptionGroup = (ExceptionGroup,)
+
+    # TaskGroup shim for 3.10
+    try:
+        from asyncio import TaskGroup
+    except ImportError:
+        class TaskGroup:
+            def __init__(self):
+                self._tasks = []
+            async def __aenter__(self): return self
+            async def __aexit__(self, et, ev, tb):
+                if not self._tasks: return
+                done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
+                for t in pending: t.cancel()
+                if pending: await asyncio.gather(*pending, return_exceptions=True)
+                exceptions = [t.exception() for t in done if t.exception()]
+                if exceptions: raise ExceptionGroup("TaskGroup failure", exceptions)
+            def create_task(self, coro, name=None):
+                t = asyncio.create_task(coro, name=name)
+                self._tasks.append(t)
+                return t
+
 logger = logging.getLogger("hamilton.supervisor")
 
 
@@ -143,6 +182,8 @@ class SupervisorConfig:
     project_hash: Optional[str] = None
     secrets: Optional[list[str]] = None
     linter_cmd: Optional[list[str]] = None
+    concurrency_strategy: str = "full"  # "full", "reduced", "minimal"
+    docker_memory_gb: int = 4
 
 
 class HamiltonSupervisor:
@@ -216,6 +257,7 @@ class HamiltonSupervisor:
         self._kill_fired = False
         self._staging_ctx = None
         self._construction_driver = None
+        self._p3_artifact_path = None  # populated by _run_p3_task on success
 
         try:
             stage_path = await self._pre_flight()
@@ -312,42 +354,89 @@ class HamiltonSupervisor:
         logger.info("SUPERVISOR [LAUNCH]: Starting P1/P2/P3 streams concurrently.")
 
         try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._run_p1_task(), name="P1:Validation")
-                tg.create_task(self._run_p2_task(), name="P2:Quality")
-                # P3 wraps its own errors — BuildError never escapes the group.
-                tg.create_task(self._run_p3_task(stage_path), name="P3:Construction")
+            async with TaskGroup() as tg:
+                if self._config.concurrency_strategy == "full":
+                    # P1 + P2 + P3 (Parallel)
+                    tg.create_task(self._run_p1_task(), name="P1:Validation")
+                    tg.create_task(self._run_p2_task(), name="P2:Quality")
+                    tg.create_task(self._run_p3_task(stage_path), name="P3:Construction")
+                
+                elif self._config.concurrency_strategy == "reduced":
+                    # P1 + P2 (Parallel), then P3
+                    pass # Handled below
+                
+                elif self._config.concurrency_strategy == "minimal":
+                    # Sequential: P1, then P2, then P3
+                    pass # Handled below
 
-        except* HamiltonAlarm as eg:
-            # One or more HamiltonAlarms fired. Kill everything immediately.
-            alarm = eg.exceptions[0]
-            logger.critical(
-                "SUPERVISOR [MONITOR]: HamiltonAlarm received — executing Hamilton Kill. %s", alarm
-            )
-            self._report.kill_cause = f"HamiltonAlarm: {alarm}"
-            self._fsm.handle_signal(alarm, Priority.P1_VALIDATION)
-            await self._hamilton_kill(cause="P1:Validation")
+            # Adaptive logic for reduced/minimal strategies
+            if self._config.concurrency_strategy == "reduced":
+                # Start P1 and P2 in parallel, wait for them, then P3
+                async with TaskGroup() as tg:
+                    tg.create_task(self._run_p1_task(), name="P1:Validation")
+                    tg.create_task(self._run_p2_task(), name="P2:Quality")
+                # After P1/P2 finish (and pass), start P3
+                await self._run_p3_task(stage_path)
 
-        except* QualityViolation as eg:
-            # QualityViolation from P2. Escalate to kill only in --strict mode.
-            violation = eg.exceptions[0]
-            if self._config.strict:
-                logger.error(
-                    "SUPERVISOR [MONITOR]: QualityViolation in --strict mode — executing Hamilton Kill."
+            elif self._config.concurrency_strategy == "minimal":
+                # Fully sequential
+                await self._run_p1_task()
+                await self._run_p2_task()
+                await self._run_p3_task(stage_path)
+
+        except _ExceptionGroup as eg:
+            # Python 3.10 compatible except* logic
+            # Extract specific exceptions and leave the rest in a new group.
+            
+            p1_alarms = []
+            p2_violations = []
+            other_exceptions = []
+            
+            def process_group(group):
+                for e in getattr(group, "exceptions", []):
+                    if isinstance(e, HamiltonAlarm):
+                        p1_alarms.append(e)
+                    elif isinstance(e, QualityViolation):
+                        p2_violations.append(e)
+                    elif hasattr(e, "exceptions"):
+                        process_group(e)
+                    else:
+                        other_exceptions.append(e)
+            
+            process_group(eg)
+            
+            # P1 Alarms have highest priority. Kill everything immediately.
+            if p1_alarms:
+                alarm = p1_alarms[0]
+                logger.critical(
+                    "SUPERVISOR [MONITOR]: HamiltonAlarm received — executing Hamilton Kill. %s", alarm
                 )
-                self._report.kill_cause = f"QualityViolation(strict): {violation}"
-                self._fsm.handle_signal(violation, Priority.P1_VALIDATION)
-                await self._hamilton_kill(cause="P2:Quality(strict)")
+                self._report.kill_cause = f"HamiltonAlarm: {alarm}"
+                self._fsm.handle_signal(alarm, Priority.P1_VALIDATION)
+                await self._hamilton_kill(cause="P1:Validation")
+                
+            # If no P1 Alarm, check for QualityViolation
+            elif p2_violations:
+                violation = p2_violations[0]
+                if self._config.strict:
+                    logger.error(
+                        "SUPERVISOR [MONITOR]: QualityViolation in --strict mode — executing Hamilton Kill."
+                    )
+                    self._report.kill_cause = f"QualityViolation(strict): {violation}"
+                    self._fsm.handle_signal(violation, Priority.P1_VALIDATION)
+                    await self._hamilton_kill(cause="P1:Validation")
+                else:
+                    logger.warning(
+                        "SUPERVISOR [MONITOR]: QualityViolation detected (non-strict) — continuing mission."
+                    )
+                    self._fsm.handle_signal(violation, Priority.P2_QUALITY)
+                    # If we aren't killing, we must re-raise any other exceptions
+                    if other_exceptions:
+                        raise _ExceptionGroup[0]("Unhandled exceptions", other_exceptions) from None
+            
             else:
-                logger.warning(
-                    "SUPERVISOR [MONITOR]: QualityViolation detected (non-strict) — continuing. %s",
-                    violation,
-                )
-                self._fsm.handle_signal(violation, Priority.P2_QUALITY)
-                # Record in stream results
-                self._report.stream_results.setdefault(
-                    "P2:Quality", StreamResult(name="P2:Quality")
-                ).outcome = "warned"
+                # No Hamilton signals found; re-raise the entire group.
+                raise eg from None
 
     async def _run_p1_task(self) -> None:
         """
@@ -417,7 +506,7 @@ class HamiltonSupervisor:
 
     async def _run_p3_task(self, stage_path: Path) -> None:
         """
-        P3 Construction stream — wraps ConstructionDriver.run() in a thread.
+        P3 Construction stream — calls ConstructionDriver.run() directly (async).
 
         CRITICAL ISOLATION RULE:
             BuildError is caught HERE and never escapes the TaskGroup. This
@@ -425,10 +514,15 @@ class HamiltonSupervisor:
 
         CANCELLATION AWARENESS:
             If CancelledError arrives, it means P1 fired a HamiltonAlarm and
-            the TaskGroup is tearing down. We call terminate() directly on the
+            the TaskGroup is tearing down. We await terminate() directly on the
             driver to kill the Docker subprocess (asyncio.CancelledError cancels
             the Python Task, not the os-level subprocess). We then log
             "cancelled_by" so the forensic report shows the true cause.
+
+        ASYNC DESIGN:
+            ConstructionDriver.run() is async and uses asyncio.create_subprocess_exec
+            internally, so this task does NOT block the event loop during the build.
+            The TaskGroup remains responsive to P1 signals at all times.
         """
         result_slot = StreamResult(name="P3:Construction")
         self._report.stream_results["P3:Construction"] = result_slot
@@ -441,13 +535,21 @@ class HamiltonSupervisor:
             cache_ref=self._config.cache_ref,
             project_hash=self._config.project_hash,
             secrets=self._config.secrets,
+            memory_gb=self._config.docker_memory_gb,
         )
         # Store reference before any await — kill handler needs it.
         self._construction_driver = driver
 
         try:
-            await asyncio.to_thread(driver.run)
+            # Direct await — driver.run() is async and non-blocking.
+            p3_result = await driver.run()
             result_slot.outcome = "success"
+
+            # Propagate artifact_path so _post_flight() can hand it to AuditChain.
+            # Stored on the supervisor so _post_flight() can read it without
+            # threading result objects through the call chain.
+            if p3_result and p3_result.output:
+                self._p3_artifact_path = p3_result.output.get("artifact_path")
 
         except BuildError as exc:
             # P3-only failure — log it, record it, do NOT re-raise.
@@ -464,9 +566,10 @@ class HamiltonSupervisor:
             logger.warning(
                 "SUPERVISOR [P3]: Task cancelled (cause=%s) — reaping Docker subprocess.", cause
             )
-            # Terminate the underlying Docker process. CancelledError only
-            # stops the asyncio Task; the Popen subprocess keeps running otherwise.
-            driver.terminate()
+            # Await terminate() to surgically reap the BuildKit process group.
+            # CancelledError only stops the asyncio Task; the subprocess keeps
+            # running until explicitly killed.
+            await driver.terminate()
             result_slot.outcome = "cancelled"
             result_slot.cancelled_by = cause
             raise  # Must re-raise CancelledError so TaskGroup tears down cleanly.
@@ -487,8 +590,8 @@ class HamiltonSupervisor:
         Idempotent emergency stop procedure.
 
         Terminates the Docker subprocess (P3) immediately via the driver's
-        terminate() method, which uses os.killpg on POSIX to reap the entire
-        BuildKit process tree — not just the top-level docker process.
+        async terminate() method, which uses os.killpg on POSIX to reap the
+        entire BuildKit process tree — not just the top-level docker process.
 
         Safe to call multiple times — subsequent calls are no-ops.
 
@@ -502,11 +605,11 @@ class HamiltonSupervisor:
         self._kill_fired = True
         logger.critical("SUPERVISOR: *** HAMILTON KILL *** triggered by %s", cause)
 
-        # Terminate P3 Docker subprocess. P1/P2 are asyncio tasks and will be
-        # cancelled by the TaskGroup machinery — no manual cancellation needed.
+        # Await terminate() so the SIGTERM → SIGKILL grace period runs
+        # asynchronously without blocking the event loop.
         if self._construction_driver is not None:
             logger.warning("SUPERVISOR: Terminating P3 Docker subprocess (PID reaping).")
-            self._construction_driver.terminate()
+            await self._construction_driver.terminate()
 
     async def _post_flight(self) -> None:
         """
@@ -522,6 +625,15 @@ class HamiltonSupervisor:
 
         On success, the artifact is chmod'd to 0o444 (read-only).
 
+        ARTIFACT HANDOFF CONTRACT:
+            The binary_path passed to AuditChain is resolved from the P3
+            DriverResult's ``artifact_path`` key when available. This closes
+            the design gap between construction.py and audit/chain.py —
+            P3 now explicitly tells the Supervisor where the artifact landed
+            rather than relying on the static SupervisorConfig.binary_path.
+            If P3 did not report an artifact_path (e.g., it was cancelled),
+            we fall back to the config value so post-flight always has a path.
+
         NOTE: StagingError is deliberately caught here because AuditChain raises
         it for a missing binary. That must NOT propagate to ship()'s outer
         except StagingError handler (which is reserved for pre-flight failures).
@@ -529,7 +641,11 @@ class HamiltonSupervisor:
         from core.exceptions import AuditFailure, StagingError as _StagingError
 
         self._fsm.transition_to(FlightState.VERIFYING)
-        binary_path = Path(self._config.binary_path)
+
+        # Prefer the artifact_path reported by P3; fall back to config.
+        # _p3_artifact_path is set in _run_p3_task on successful build.
+        raw_path = getattr(self, "_p3_artifact_path", None) or self._config.binary_path
+        binary_path = Path(raw_path)
 
         logger.info("SUPERVISOR [POST-FLIGHT]: Starting audit chain on %s", binary_path)
 
@@ -577,12 +693,12 @@ class HamiltonSupervisor:
             # been reaped by _hamilton_kill(), but terminate() is idempotent.
             if self._construction_driver is not None:
                 logger.debug("SUPERVISOR [CLEANUP]: Late-reaping Docker subprocess.")
-                self._construction_driver.terminate()
+                await self._construction_driver.terminate()
 
             # Remove dangling Docker containers created by this build.
             await self._cleanup_containers()
 
-            # Step 3: Reap the staging directory.
+            # Reap the staging directory.
             if self._staging_ctx is not None:
                 await self._staging_ctx.__aexit__(None, None, None)
 
@@ -597,7 +713,7 @@ class HamiltonSupervisor:
 
     async def _cleanup_containers(self) -> None:
         """
-        Remove any dangling Docker containers tagged with this build's image_tag.
+        Remove dangling Docker containers tagged with this build's image_tag.
 
         Best-effort: a non-zero exit code is logged but not raised, because
         a failed container cleanup must never block the staging directory cleanup.

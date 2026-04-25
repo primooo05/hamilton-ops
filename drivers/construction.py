@@ -23,16 +23,47 @@ Key capabilities over the simpler DockerDriver:
         ``--ssh default`` for private Git clones over the SSH agent.
 
     Surgical Process Termination
-        Uses ``subprocess.Popen`` (not ``subprocess.run``) to hold a live
-        handle to the BuildKit process. ``terminate()`` sends SIGTERM to the
-        entire process group, then SIGKILL if the group doesn't exit within
+        Uses ``asyncio.create_subprocess_exec`` to hold a live async handle to
+        the BuildKit process. ``terminate()`` sends SIGTERM to the entire
+        process group, then SIGKILL if the group doesn't exit within
         ``_SIGKILL_TIMEOUT_SECONDS``. On Windows, where ``os.killpg`` is
-        unavailable, the driver falls back to ``Popen.kill()``.
+        unavailable, the driver falls back to ``Process.kill()``.
 
-    Log Sanitisation
-        ``--build-arg KEY=VALUE`` entries whose keys match known secret
-        patterns are redacted to ``KEY=***REDACTED***`` in the log output.
-        The actual subprocess command is always passed unredacted.
+        IMPORTANT — asyncio safety: Because run() is async and uses the asyncio
+        subprocess API, it does NOT block the event loop. The Supervisor's
+        TaskGroup can cancel P3 mid-flight without the communicate() call
+        freezing. terminate() is similarly async-safe.
+
+    Log Sanitisation (command + stream)
+        ``--build-arg KEY=VALUE`` entries whose keys match known secret patterns
+        are redacted to ``KEY=***REDACTED***`` in the logged command.
+        Additionally, every stdout/stderr line produced by the build process is
+        passed through ``_redact_line()`` before being emitted to the log, so
+        that a ``RUN echo $SECRET`` in the Dockerfile cannot leak values.
+
+    Resource Guardrails (Pillar E)
+        Injects ``--memory`` and CPU quota flags to prevent a runaway build
+        from degrading the host. Defaults are 4 GB RAM and all logical cores.
+        Both are configurable at construction time.
+
+    Dockerfile Existence Validation
+        The driver verifies that the target Dockerfile exists before launching
+        the build. Missing Dockerfile → clean EnvError, not a cryptic Docker
+        error message.
+
+    Artifact Handoff to Audit Chain
+        After a successful build, ``DriverResult.output`` includes an
+        ``artifact_path`` key pointing to the expected binary location inside
+        the staging directory. The Supervisor passes this directly to
+        ``AuditChain.run()`` to close the handoff contract between P3 and the
+        post-flight audit step.
+
+    start_new_session vs os.setsid
+        The driver uses ``start_new_session=True`` (equivalent to
+        ``preexec_fn=os.setsid``) to move the subprocess into its own process
+        group. This is a Python-idiomatic wrapper around the same POSIX
+        ``setsid(2)`` syscall, so ``os.getpgid(pid)`` in ``terminate()``
+        always returns a distinct PGID for targeted ``killpg`` calls.
 
 Error-mapping contract:
     | Condition                     | Hamilton Signal              |
@@ -41,11 +72,13 @@ Error-mapping contract:
     | OOM-killed (137)              | BuildError (oom=True context) |
     | Non-zero exit (build failure) | BuildError                   |
     | Daemon running as root        | EnvError (rootless violation) |
+    | Dockerfile not found          | EnvError (before launch)     |
     | P1 Abort (terminate called)   | BuildError (aborted=True)    |
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -73,6 +106,12 @@ _SECRET_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern for redacting secrets that appear inline in build output.
+# Matches common KEY=VALUE patterns in Docker RUN output or env-dump commands.
+_SECRET_LINE_PATTERN = re.compile(
+    r"(?i)(password|passwd|pwd|secret|token|api[_\-]?key|auth|credential)\s*[=:]\s*\S+",
+)
+
 
 class ConstructionDriver:
     """
@@ -80,14 +119,17 @@ class ConstructionDriver:
 
     Manages the *entire lifecycle* of a ``docker build``
     invocation: command construction, cache injection, secret mounting,
-    live process control, and log sanitisation.
+    live process control, stream log sanitisation, and resource guardrails.
 
     The key difference from ``DockerDriver`` is that execution goes through
-    ``subprocess.Popen`` (not ``subprocess.run``), giving the driver a live
-    handle so the Supervisor can call ``terminate()`` in response to a P1 Alarm.
+    ``asyncio.create_subprocess_exec`` (not ``subprocess.run``), giving the
+    driver a non-blocking async handle so the Supervisor's TaskGroup can
+    cancel P3 mid-flight without freezing the event loop. ``terminate()``
+    is likewise async so it can be awaited from within the TaskGroup's
+    cancellation handler.
 
     All subprocess creation is routed through ``_build_popen`` so that tests
-    can replace the real ``Popen`` without mocking the OS-level module.
+    can replace the real subprocess factory without mocking OS-level modules.
     """
 
     def __init__(
@@ -101,86 +143,144 @@ class ConstructionDriver:
         secrets: Optional[list[str]] = None,
         ssh: bool = False,
         no_cache: bool = False,
+        memory_gb: int = 4,
+        cpu_count: Optional[int] = None,
+        artifact_subpath: Optional[str] = None,
     ) -> None:
         """
         Args:
-            stage_path:    Absolute path to the staging directory.
-                           Passed as a list element, never shell-expanded.
-            image_tag:     Docker image tag, e.g. ``myapp:sha256-abc123``.
-            dockerfile:    Optional path to a Dockerfile. Defaults to
-                           ``<stage_path>/Dockerfile``.
-            cache_ref:     Registry reference for BuildKit layer caching,
-                           e.g. ``ghcr.io/org/myapp:buildcache``. When set,
-                           ``--cache-from`` and ``--cache-to`` are injected.
-            project_hash:  Deterministic identifier for the project state
-                           (e.g., SHA256 of the lock files). Injected as
-                           ``--build-arg CACHE_ID=<hash>`` to scope the
-                           BuildKit cache per project, preventing cross-project
-                           cache contamination on shared CI runners.
-            secrets:       List of BuildKit secret mount specs in the form
-                           ``id=<name>,src=<path>``. Each item becomes a
-                           ``--secret`` flag. The file at ``src`` is mounted
-                           read-only into the build context; nothing is baked
-                           into an image layer.
-            ssh:           If True, passes ``--ssh default`` so the build
-                           can access private Git repositories via the SSH
-                           agent socket. Requires the agent to be running.
-            no_cache:      If True, passes ``--no-cache`` to disable all
-                           BuildKit layer caching (useful for security scans).
-                           This overrides ``cache_ref``.
+            stage_path:       Absolute path to the staging directory.
+                              Passed as a list element, never shell-expanded.
+            image_tag:        Docker image tag, e.g. ``myapp:sha256-abc123``.
+            dockerfile:       Optional path to a Dockerfile. Defaults to
+                              ``<stage_path>/Dockerfile``.
+            cache_ref:        Registry reference for BuildKit layer caching,
+                              e.g. ``ghcr.io/org/myapp:buildcache``. When set,
+                              ``--cache-from`` and ``--cache-to`` are injected.
+            project_hash:     Deterministic identifier for the project state
+                              (e.g., SHA256 of the lock files). Injected as
+                              ``--build-arg CACHE_ID=<hash>`` to scope the
+                              BuildKit cache per project, preventing cross-project
+                              cache contamination on shared CI runners.
+            secrets:          List of BuildKit secret mount specs in the form
+                              ``id=<name>,src=<path>``. Each item becomes a
+                              ``--secret`` flag. The file at ``src`` is mounted
+                              read-only into the build context; nothing is baked
+                              into an image layer.
+            ssh:              If True, passes ``--ssh default`` so the build
+                              can access private Git repositories via the SSH
+                              agent socket. Requires the agent to be running.
+            no_cache:         If True, passes ``--no-cache`` to disable all
+                              BuildKit layer caching (useful for security scans).
+                              This overrides ``cache_ref``.
+            memory_gb:        Docker memory limit in gigabytes (Pillar E guardrail).
+                              Default: 4 GB. Injected as ``--memory <N>g``.
+            cpu_count:        Number of logical CPU cores to allocate to the build.
+                              Default: ``os.cpu_count()``. Injected as a
+                              ``--cpu-quota`` relative to ``--cpu-period 100000``.
+            artifact_subpath: Relative path inside ``stage_path`` where the built
+                              binary is expected after the Docker build completes.
+                              Used to populate ``artifact_path`` in DriverResult
+                              for the Audit Chain handoff. Example: ``"dist/app"``.
+                              If None, the stage_path root is used as a fallback.
         """
-        self.stage_path   = Path(stage_path).resolve()
-        self.image_tag    = image_tag
-        self.dockerfile   = Path(dockerfile).resolve() if dockerfile else self.stage_path / "Dockerfile"
-        self.cache_ref    = cache_ref
-        self.project_hash = project_hash
-        self.secrets      = secrets or []
-        self.ssh          = ssh
-        self.no_cache     = no_cache
+        self.stage_path      = Path(stage_path).resolve()
+        self.image_tag       = image_tag
+        self.dockerfile      = Path(dockerfile).resolve() if dockerfile else self.stage_path / "Dockerfile"
+        self.cache_ref       = cache_ref
+        self.project_hash    = project_hash
+        self.secrets         = secrets or []
+        self.ssh             = ssh
+        self.no_cache        = no_cache
+        self.memory_gb       = memory_gb
+        # Detect CPU count at init time; fall back to 1 if detection fails.
+        self.cpu_count       = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+        self.artifact_subpath = artifact_subpath
 
-        # Live process handle — set during run(), cleared after wait().
-        self._proc: Optional[subprocess.Popen] = None
+        # Live async process handle — set during run(), cleared after wait().
+        self._proc: Optional[asyncio.subprocess.Process] = None
         self._aborted = False
 
 
-    def run(self) -> DriverResult:
+    async def run(self) -> DriverResult:
         """
-        Launch ``docker build`` and wait for it to complete.
+        Launch ``docker build`` and stream its output asynchronously.
+
+        Uses ``asyncio.create_subprocess_exec`` so the event loop is never
+        blocked while Docker builds. Every stdout/stderr line is sanitised
+        by ``_redact_line()`` before being logged, so build commands that
+        accidentally echo secrets cannot leak them to the terminal.
 
         Returns:
-            DriverResult(success=True, output={"image_tag": ..., "stdout": ...})
+            DriverResult(success=True, output={"image_tag": ..., "stdout": ..., "artifact_path": ...})
 
         Raises:
+            EnvError:   If the Dockerfile is missing before the build starts.
             BuildError: If the build fails, is OOM-killed, or is aborted.
             EnvError:   If the Docker binary is missing (exit 127).
         """
+        # --- Feature 5: Dockerfile existence validation ---
+        # Catch the missing Dockerfile BEFORE handing off to Docker so the
+        # operator gets a clean EnvError, not a cryptic "unable to prepare
+        # context: the Dockerfile cannot be found" from the daemon.
+        if not self.dockerfile.exists():
+            raise EnvError(
+                f"Dockerfile not found at '{self.dockerfile}'. "
+                "Verify the staging directory and dockerfile path are correct.",
+                context={"dockerfile": str(self.dockerfile)},
+            )
+
         cmd = self._build_command()
         safe_cmd = _redact_build_args(cmd)
         logger.info("CONSTRUCTION: Launching P3 build stream → %s", safe_cmd)
 
-        proc = self._build_popen(cmd)
+        proc = await self._build_popen(cmd)
         self._proc = proc
-        stdout, stderr = proc.communicate()
-        returncode = proc.returncode
-        self._proc = None  # clear the handle after the process exits
 
+        # Stream stdout and stderr line-by-line, redacting secrets in real time.
+        stdout_lines: list[str] = []
+        try:
+            stdout_lines = await self._stream_output(proc)
+        finally:
+            # Always clear the process handle, even if _stream_output raises.
+            self._proc = None
+
+        returncode = proc.returncode
         if returncode != 0:
-            self._map_exit_code(returncode, stderr or "", aborted=self._aborted)
+            stderr_tail = "\n".join(stdout_lines[-20:]) if stdout_lines else ""
+            self._map_exit_code(returncode, stderr_tail, aborted=self._aborted)
+
+        # --- Feature 6: Artifact path handoff ---
+        # Resolve the expected binary location. The Supervisor passes this
+        # directly to AuditChain.run() to close the P3 → audit contract.
+        if self.artifact_subpath:
+            artifact_path = str(self.stage_path / self.artifact_subpath)
+        else:
+            # Fall back to the stage root if no specific binary path is known.
+            artifact_path = str(self.stage_path)
 
         return DriverResult(
             success=True,
-            output={"image_tag": self.image_tag, "stdout": stdout},
+            output={
+                "image_tag":     self.image_tag,
+                "stdout":        "\n".join(stdout_lines),
+                "artifact_path": artifact_path,
+            },
         )
 
-    def terminate(self) -> None:
+    async def terminate(self) -> None:
         """
         Surgically abort the running build in response to a P1 Hamilton Alarm.
 
         Sends SIGTERM to the BuildKit process group (POSIX) or calls
-        ``Popen.kill()`` on Windows. If the process group does not exit
+        ``Process.kill()`` on Windows. If the process group does not exit
         within ``_SIGKILL_TIMEOUT`` seconds, SIGKILL is sent as a last resort.
 
         This is idempotent — calling it when no build is running is a no-op.
+
+        NOTE — async design: terminate() is async so it can be awaited from
+        within the Supervisor's TaskGroup cancellation handler without blocking
+        the event loop during the SIGKILL grace period sleep.
         """
         if self._proc is None:
             logger.debug("CONSTRUCTION: terminate() called but no active build process.")
@@ -193,16 +293,18 @@ class ConstructionDriver:
         if hasattr(os, "killpg") and hasattr(os, "getpgid"):
             # POSIX: kill the entire process group so BuildKit child processes
             # (spawners, cache writers) are also reaped immediately.
+            # start_new_session=True (used in _build_popen) ensures the child
+            # has its own PGID, so getpgid() always returns a distinct group.
             try:
                 pgid = os.getpgid(pid)
                 os.killpg(pgid, signal.SIGTERM)
                 # Give the process group time to clean up gracefully.
                 deadline = time.monotonic() + _SIGKILL_TIMEOUT
                 while time.monotonic() < deadline:
-                    if self._proc.poll() is not None:
+                    if self._proc.returncode is not None:
                         break
-                    time.sleep(0.1)
-                if self._proc.poll() is None:
+                    await asyncio.sleep(0.1)
+                if self._proc.returncode is None:
                     logger.warning("CONSTRUCTION: SIGTERM ignored — escalating to SIGKILL.")
                     os.killpg(pgid, getattr(signal, "SIGKILL", 9))
             except ProcessLookupError:
@@ -265,7 +367,8 @@ class ConstructionDriver:
           2. Cache flags (--cache-from, --cache-to, --build-arg CACHE_ID)
           3. Secret mounts (--secret id=...)
           4. SSH agent  (--ssh default)
-          5. Build context (staging directory — always last)
+          5. Resource guardrails (--memory, --cpu-period, --cpu-quota)
+          6. Build context (staging directory — always last)
         """
         cmd: list[str] = [
             "docker", "build",
@@ -291,6 +394,13 @@ class ConstructionDriver:
         # --- SSH agent ---
         if self.ssh:
             cmd += ["--ssh", "default"]
+
+        # --- Feature 4: Resource guardrails (Pillar E) ---
+        # Cap memory to prevent OOM cascades on shared CI hosts.
+        cmd += ["--memory", f"{self.memory_gb}g"]
+        # Cap CPU using period/quota so BuildKit cannot monopolise all cores.
+        # cpu_quota = cpu_count * period means the build gets cpu_count full cores.
+        cmd += ["--cpu-period", "100000", "--cpu-quota", str(self.cpu_count * 100000)]
 
         # Build context must be last — always the immutable staging directory.
         cmd.append(str(self.stage_path))
@@ -331,21 +441,49 @@ class ConstructionDriver:
             context={"exit_code": code, "stderr": stderr},
         )
 
-    def _build_popen(self, cmd: list[str]) -> subprocess.Popen:
+    async def _build_popen(self, cmd: list[str]) -> asyncio.subprocess.Process:
         """
-        Create the ``Popen`` object for the build process.
+        Create the asyncio ``Process`` object for the build.
 
-        ``start_new_session=True`` moves the process into its own session
-        (and therefore its own process group), enabling ``os.killpg`` to
-        reap BuildKit child processes without touching the Python host.
+        ``start_new_session=True`` is equivalent to ``preexec_fn=os.setsid``
+        — it moves the process into its own session (and therefore its own
+        process group), enabling ``os.killpg`` to reap BuildKit child processes
+        without touching the Python host process.
+
+        Using ``asyncio.create_subprocess_exec`` instead of ``subprocess.Popen``
+        ensures the event loop is not blocked while Docker builds, which is
+        critical for the Supervisor's TaskGroup to remain responsive to P1
+        cancellation signals during long builds.
         """
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        return await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,  # merge stderr into stdout stream
             start_new_session=True,
         )
+
+    async def _stream_output(self, proc: asyncio.subprocess.Process) -> list[str]:
+        """
+        Read the process stdout line-by-line, redacting secrets before logging.
+
+        Returns the accumulated (redacted) lines for inclusion in DriverResult.
+        """
+        lines: list[str] = []
+        if proc.stdout is None:
+            await proc.wait()
+            return lines
+
+        async for raw_line in proc.stdout:
+            line = raw_line.decode("utf-8", errors="replace").rstrip()
+            # --- Feature 3: Stream sanitisation ---
+            # Redact any line that matches a known secret pattern before
+            # it reaches the terminal or log aggregator.
+            safe_line = _redact_line(line)
+            logger.debug("CONSTRUCTION [BUILD]: %s", safe_line)
+            lines.append(safe_line)
+
+        await proc.wait()
+        return lines
 
     def _run_subprocess(self, cmd: list[str]) -> subprocess.CompletedProcess:
         """
@@ -353,6 +491,7 @@ class ConstructionDriver:
         Patch this in tests for check_health() coverage.
         """
         return subprocess.run(cmd, capture_output=True, text=True)
+
 
 def _redact_build_args(cmd: list[str]) -> list[str]:
     """
@@ -381,3 +520,27 @@ def _redact_build_args(cmd: list[str]) -> list[str]:
                     redacted[i + 1] = f"{key}=***REDACTED***"
         i += 1
     return redacted
+
+
+def _redact_line(line: str) -> str:
+    """
+    Redact secret patterns from a single build output line.
+
+    Applied to every stdout/stderr line produced by the Docker build process
+    so that a ``RUN echo $DB_PASSWORD`` or a ``printenv`` command cannot leak
+    credentials to the terminal or log aggregator.
+
+    Uses ``re.sub`` on ``_SECRET_LINE_PATTERN`` to replace the entire
+    ``KEY=VALUE`` or ``KEY: VALUE`` match with ``KEY=***REDACTED***``,
+    preserving the key name for auditability.
+
+    Example::
+
+        _redact_line("Build step: DB_PASSWORD=hunter2 injected")
+        # → "Build step: DB_PASSWORD=***REDACTED*** injected"
+    """
+    def _replace(match: re.Match) -> str:
+        # Preserve only the key portion (group 1); redact the value.
+        return f"{match.group(1)}=***REDACTED***"
+
+    return _SECRET_LINE_PATTERN.sub(_replace, line)
