@@ -154,7 +154,12 @@ class DriverRegistry:
         missing = [
             f"{priority.label} → '{key}'"
             for priority, key in _PILLAR_KEYS.items()
-            if key not in self._drivers
+            # Check BOTH that the key exists AND that it was registered with the
+            # correct Priority.  A driver named "k6" registered as P3_CONSTRUCTION
+            # would pass the old `key not in self._drivers` check but satisfy the
+            # wrong pillar — the Flight Computer would launch without a real
+            # P1 Validation tool.
+            if key not in self._drivers or self._priorities.get(key) != priority
         ]
         if missing:
             raise RegistryError(

@@ -113,7 +113,7 @@ class AuditStep(abc.ABC):
 
 class BinaryDiscoveryStep(AuditStep):
     """
-    Step 1: Verify the binary exists and record its initial SHA256.
+    Verify the binary exists and record its initial SHA256.
 
     This is the "pre-condition verification" step. A missing binary means
     the Construction stream (P3) failed to deliver the capsule — the
@@ -146,7 +146,7 @@ class BinaryDiscoveryStep(AuditStep):
 
 class SecretScannerStep(AuditStep):
     """
-    Step 2: Regex-scan the binary for secret patterns.
+    Regex-scan the binary for secret patterns.
 
     Attempts to read the binary as UTF-8 text (ignoring decode errors)
     and matches against known secret patterns (API keys, PEM headers,
@@ -187,7 +187,7 @@ class SecretScannerStep(AuditStep):
 
 class BuildToolLeakStep(AuditStep):
     """
-    Step 3: Scan the binary's parent directory for leaked build tools.
+    Scan the binary's parent directory for leaked build tools.
 
     Per Pillar C: gcc, mvn, npm (and others from ``_BUILD_TOOLS``) must
     NOT appear in the production capsule. Their presence indicates the
@@ -230,7 +230,7 @@ class BuildToolLeakStep(AuditStep):
 
 class SBOMGenerationStep(AuditStep):
     """
-    Step 4: Generate a Software Bill of Materials via Syft.
+    Generate a Software Bill of Materials via Syft.
 
     In a real environment, this calls ``syft <binary_path> -o json``.
     The SBOM is written to a temp file managed by the AuditChain, and

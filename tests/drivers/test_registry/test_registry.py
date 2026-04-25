@@ -19,9 +19,6 @@ from core.exceptions import DriverNotFoundError, RegistryError
 from core.priorities import Priority
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture()
 def empty_registry() -> DriverRegistry:
