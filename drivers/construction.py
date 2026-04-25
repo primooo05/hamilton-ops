@@ -140,6 +140,7 @@ class ConstructionDriver:
 
         # Live process handle — set during run(), cleared after wait().
         self._proc: Optional[subprocess.Popen] = None
+        self._aborted = False
 
 
     def run(self) -> DriverResult:
@@ -157,13 +158,14 @@ class ConstructionDriver:
         safe_cmd = _redact_build_args(cmd)
         logger.info("CONSTRUCTION: Launching P3 build stream → %s", safe_cmd)
 
-        self._proc = self._build_popen(cmd)
-        stdout, stderr = self._proc.communicate()
-        returncode = self._proc.returncode
+        proc = self._build_popen(cmd)
+        self._proc = proc
+        stdout, stderr = proc.communicate()
+        returncode = proc.returncode
         self._proc = None  # clear the handle after the process exits
 
         if returncode != 0:
-            self._map_exit_code(returncode, stderr or "")
+            self._map_exit_code(returncode, stderr or "", aborted=self._aborted)
 
         return DriverResult(
             success=True,
@@ -184,6 +186,7 @@ class ConstructionDriver:
             logger.debug("CONSTRUCTION: terminate() called but no active build process.")
             return
 
+        self._aborted = True
         pid = self._proc.pid
         logger.warning("CONSTRUCTION: P1 Alarm — terminating BuildKit process (PID=%d)", pid)
 
@@ -201,7 +204,7 @@ class ConstructionDriver:
                     time.sleep(0.1)
                 if self._proc.poll() is None:
                     logger.warning("CONSTRUCTION: SIGTERM ignored — escalating to SIGKILL.")
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(pgid, getattr(signal, "SIGKILL", 9))
             except ProcessLookupError:
                 # Process already exited between our check and the kill call.
                 logger.debug("CONSTRUCTION: Process %d already exited.", pid)
@@ -210,6 +213,7 @@ class ConstructionDriver:
             self._proc.kill()
 
         logger.info("CONSTRUCTION: BuildKit process group reaped.")
+        self._proc = None
 
     def check_health(self) -> DriverResult:
         """
@@ -294,7 +298,7 @@ class ConstructionDriver:
 
 
     @staticmethod
-    def _map_exit_code(code: int, stderr: str) -> None:
+    def _map_exit_code(code: int, stderr: str, aborted: bool = False) -> None:
         """
         Translate a non-zero Docker exit code into the correct Hamilton signal.
 
@@ -316,10 +320,10 @@ class ConstructionDriver:
             )
         # Negative return codes on POSIX typically mean the process was killed
         # by a signal (e.g., SIGTERM = -15, SIGKILL = -9).
-        if code < 0:
+        if code < 0 or aborted:
             raise BuildError(
-                f"BuildKit process terminated by signal {-code} "
-                f"(likely a P1 Abort). Exit code: {code}.",
+                f"BuildKit process terminated (likely a P1 Abort). "
+                f"Exit code: {code}.",
                 context={"exit_code": code, "aborted": True},
             )
         raise BuildError(

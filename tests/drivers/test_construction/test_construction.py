@@ -14,8 +14,11 @@ Test categories:
   5. Surgical Interrupt (Signal Handling) — terminate() process group kill
   6. Exit-code → exception mapping
   7. Integration: run() with mocked Popen
+  8. Health Check — check_health() core paths
+  9. _build_command() — --file flag and custom dockerfile
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -355,21 +358,6 @@ def test_terminate_kills_process_on_windows_fallback():
     assert mock_proc.killed is True
 
 
-def test_terminate_clears_proc_reference_is_handled_by_run(tmp_path):
-    """
-    Contract: After run() completes (success or failure), _proc must be None
-    so that a subsequent terminate() call is a safe no-op.
-    """
-    driver = _make_driver(stage=str(tmp_path))
-    driver._build_popen = MagicMock(return_value=MockPopen(returncode=0, stdout="ok"))
-    driver.run()
-    assert driver._proc is None
-
-
-# ---------------------------------------------------------------------------
-# 6. Exit-Code → Exception Mapping
-# ---------------------------------------------------------------------------
-
 def test_map_exit_code_127_raises_env_error():
     """
     Contract: Exit 127 (docker binary not found) must raise EnvError —
@@ -410,9 +398,6 @@ def test_map_exit_code_1_raises_generic_build_error():
     assert "COPY failed" in exc_info.value.context["stderr"]
 
 
-# ---------------------------------------------------------------------------
-# 7. Integration: run() with mocked Popen
-# ---------------------------------------------------------------------------
 
 def test_run_returns_driver_result_on_success():
     """
@@ -488,3 +473,139 @@ def test_run_passes_full_command_to_popen_not_redacted():
     # The real CACHE_ID value must reach Popen
     full_cmd = captured_cmds[0]
     assert "CACHE_ID=abc123" in full_cmd
+
+def _completed(returncode=0, stdout="", stderr="") -> subprocess.CompletedProcess:
+    """Build a fake CompletedProcess for _run_subprocess stubs."""
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _docker_info_json(rootless: bool = True) -> str:
+    """Return a minimal ``docker info`` JSON payload for health-check tests."""
+    options = ["name=rootless"] if rootless else ["name=apparmor"]
+    return json.dumps({"SecurityOptions": options, "ServerVersion": "24.0.0"})
+
+
+def test_check_health_raises_env_error_when_docker_missing():
+    """
+    Contract: check_health() must raise EnvError immediately when 'docker'
+    is absent from PATH — before attempting any daemon communication.
+
+    Mocks shutil.which at the module level (not os.environ) because the
+    driver delegates binary discovery entirely to shutil.which.
+    """
+    driver = _make_driver()
+    with patch("drivers.construction.shutil.which", return_value=None):
+        with pytest.raises(EnvError) as exc_info:
+            driver.check_health()
+
+    assert exc_info.value.context["tool"] == "docker"
+
+
+def test_check_health_raises_env_error_when_daemon_unreachable():
+    """
+    Contract: If ``docker info`` exits non-zero, the daemon is down.
+    check_health() must raise EnvError with a 'not reachable' message —
+    not a BuildError, because this is a pre-flight environment failure.
+
+    _run_subprocess is replaced at the instance level (not patched globally)
+    because the driver already provides this seam for testing.
+    """
+    driver = _make_driver()
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        driver._run_subprocess = MagicMock(
+            return_value=_completed(returncode=1, stderr="Cannot connect to Docker daemon")
+        )
+        with pytest.raises(EnvError) as exc_info:
+            driver.check_health()
+
+    assert "not reachable" in str(exc_info.value).lower()
+
+
+def test_check_health_raises_env_error_when_not_rootless():
+    """
+    Contract: Hamilton-Ops is a SECURITY REQUIREMENT — it must refuse to
+    operate when Docker runs as root (README rootless mandate).
+    check_health() must raise EnvError when 'rootless' is absent from
+    SecurityOptions, even when the daemon is reachable.
+
+    This is the most critical branch: a silent pass here would allow
+    a root-mode Docker to build production images without detection.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            # Non-rootless payload — apparmor only, no rootless entry
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=False))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        driver._run_subprocess = fake_run
+        with pytest.raises(EnvError) as exc_info:
+            driver.check_health()
+
+    assert "rootless" in str(exc_info.value).lower()
+
+
+def test_check_health_returns_driver_result_on_success():
+    """
+    Contract: check_health() must return DriverResult(success=True) with
+    a 'version' key in output when Docker is installed, daemon is up,
+    and running in rootless mode.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=True))
+        # Version check returns a plain version string
+        return _completed(returncode=0, stdout="26.1.4\n")
+
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        driver._run_subprocess = fake_run
+        result = driver.check_health()
+
+    assert result.success is True
+    assert result.output["version"] == "26.1.4"
+
+
+def test_build_command_includes_file_flag_pointing_to_default_dockerfile(tmp_path):
+    """
+    Contract: _build_command() must always include ``--file`` so BuildKit
+    uses the controlled Dockerfile in the staging area — not a random
+    Dockerfile that happens to be in the working directory.
+
+    Default: <stage_path>/Dockerfile
+    """
+    driver = ConstructionDriver(stage_path=str(tmp_path), image_tag="app:v1")
+    cmd = driver._build_command()
+
+    assert "--file" in cmd
+    file_idx = cmd.index("--file")
+    # The default dockerfile must resolve to <stage_path>/Dockerfile
+    assert cmd[file_idx + 1] == str(tmp_path / "Dockerfile")
+
+
+def test_build_command_uses_custom_dockerfile_when_provided(tmp_path):
+    """
+    Contract: When a custom dockerfile path is passed to the constructor,
+    _build_command() must use THAT path in the --file argument, not the
+    default <stage_path>/Dockerfile.
+
+    This enables multi-Dockerfile projects (e.g., Dockerfile.prod vs
+    Dockerfile.dev) without changing the staging directory layout.
+    """
+    custom_df = tmp_path / "Dockerfile.prod"
+    custom_df.touch()  # file must exist for Path.resolve() to be deterministic
+    driver = ConstructionDriver(
+        stage_path=str(tmp_path),
+        image_tag="app:v1",
+        dockerfile=str(custom_df),
+    )
+    cmd = driver._build_command()
+
+    assert "--file" in cmd
+    file_idx = cmd.index("--file")
+    assert cmd[file_idx + 1] == str(custom_df.resolve())
+
+

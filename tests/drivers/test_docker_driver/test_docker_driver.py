@@ -6,12 +6,12 @@ mapping, rootless verification) without running Docker. The
 ``_run_subprocess`` method is replaced at the instance level.
 
 Test categories:
-  1. Command construction & path sanitization
+  1. Command construction — core flags
   2. Exit-code → exception mapping (1, 127, 137)
   3. Health check — rootless mode enforcement
   4. Integration: run() with mocked subprocess
 """
-
+import logging
 import json
 import subprocess
 from pathlib import Path
@@ -96,12 +96,12 @@ def test_build_command_path_with_spaces_is_single_element(tmp_path):
     driver = DockerDriver(stage_path=str(spaced), image_tag="app:v1")
     cmd = driver._build_command()
 
-    # The full path must be one element
+    # The full path must be one element in the list. If it were split by the 
+    # shell, "my", "staging", and "dir" would appear as separate elements.
     full_path = str(driver.stage_path)
     assert full_path in cmd
-    # The space character must not split it into separate elements
-    assert " " in full_path  # confirm our path actually has a space
-    assert full_path.split(" ")[0] not in cmd or cmd.count(full_path.split(" ")[0]) == 0 or cmd.index(full_path) >= 0
+    assert "my" not in cmd
+    assert "staging" not in cmd
 
 
 def test_map_exit_code_127_raises_env_error():
@@ -139,15 +139,6 @@ def test_map_exit_code_1_raises_generic_build_error():
     assert "COPY failed" in exc_info.value.context["stderr"]
 
 
-def test_map_exit_code_127_is_env_error_not_build_error():
-    """
-    Contract: EnvError and BuildError are distinct — the Supervisor routes
-    them differently. Exit 127 must NOT be a BuildError.
-    """
-    with pytest.raises(EnvError):
-        DockerDriver._map_exit_code(127, "")
-
-
 def test_check_health_raises_env_error_when_docker_missing():
     """
     Contract: check_health() must raise EnvError when the docker binary
@@ -175,6 +166,8 @@ def test_check_health_raises_env_error_when_daemon_unreachable():
             driver.check_health()
 
     assert "not reachable" in str(exc_info.value).lower()
+    assert exc_info.value.context["tool"] == "docker"
+    assert exc_info.value.context["exit_code"] == 1
 
 
 def test_check_health_raises_env_error_when_not_rootless():
@@ -195,6 +188,7 @@ def test_check_health_raises_env_error_when_not_rootless():
             driver.check_health()
 
     assert "rootless" in str(exc_info.value).lower()
+    assert "name=apparmor" in exc_info.value.context["security_options"]
 
 
 def test_check_health_passes_when_rootless():
@@ -271,3 +265,49 @@ def test_run_raises_build_error_with_oom_context_on_exit_137():
         driver.run()
 
     assert exc_info.value.context.get("oom") is True
+
+def test_build_command_includes_file_flag_and_custom_path(tmp_path):
+    """
+    Contract: _build_command() must include --file and handle custom paths.
+    """
+    custom_df = tmp_path / "CustomDockerfile"
+    driver = _make_driver(stage=str(tmp_path), dockerfile=str(custom_df))
+    cmd = driver._build_command()
+
+    assert "--file" in cmd
+    idx = cmd.index("--file")
+    assert cmd[idx + 1] == str(custom_df.resolve())
+
+
+def test_build_command_flag_ordering():
+    """
+    Contract: Verify the exact ordering of flags in _build_command().
+    """
+    driver = _make_driver(no_cache=True)
+    cmd = driver._build_command()
+    # Expected: docker, build, --file, <file>, --tag, <tag>, --no-cache, <context>
+    assert cmd[0] == "docker"
+    assert cmd[1] == "build"
+    assert cmd[2] == "--file"
+    assert cmd[4] == "--tag"
+    assert "--no-cache" in cmd
+    assert cmd[-1] == str(driver.stage_path)
+
+
+def test_run_logs_unredacted_command(caplog):
+    """
+    Contract: DockerDriver logs the unredacted command. This is an intentional
+    design decision for the base driver as it does not handle secrets (unlike
+    ConstructionDriver). This test pins that behavior to prevent accidental
+    leaks if secret support is added later.
+    """
+    import logging
+    driver = _make_driver(tag="myapp:v1")
+    driver._run_subprocess = MagicMock(return_value=_completed(returncode=0))
+
+    with caplog.at_level(logging.INFO, logger="hamilton.drivers.docker"):
+        driver.run()
+
+    # Verify the log message contains the unredacted image tag
+    assert any("myapp:v1" in record.message for record in caplog.records)
+    assert any("Launching build stream" in record.message for record in caplog.records)

@@ -85,13 +85,15 @@ class K6Driver:
             logger.info("K6: Launching validation stream → %s", cmd)
             completed = self._run_subprocess(cmd)
 
-            # Always attempt to parse metrics first — k6 may write partial
-            # output even when the exit code is non-zero.
-            metrics = self._parse_metrics_file(json_out)
-            self._check_thresholds(metrics)
-
+            # Exit code is checked FIRST so a process crash is never masked by a coincident threshold breach.
+            # If k6 crashed hard enough to produce bad/zero metrics, _check_thresholds would silently pass
+            # (zeros are within thresholds), hiding the real failure from the Supervisor.  Crash → HamiltonAlarm must always win.
             if completed.returncode != 0:
                 self._map_exit_code(completed.returncode, completed.stderr)
+
+            # Only reached when k6 exited cleanly (returncode == 0).
+            metrics = self._parse_metrics_file(json_out)
+            self._check_thresholds(metrics)
 
         return DriverResult(
             success=True,
@@ -117,7 +119,12 @@ class K6Driver:
                 f"k6 version check failed: {completed.stderr.strip()}",
                 context={"tool": "k6", "exit_code": completed.returncode},
             )
-        version_line = completed.stdout.strip().splitlines()[0] if completed.stdout else "unknown"
+        # strip() first, then splitlines(), so whitespace-only stdout
+        # (e.g. "  \n  ") yields an empty list instead of a list with a blank
+        # string — falling back to "unknown" rather than raising IndexError.
+        stripped_stdout = completed.stdout.strip() if completed.stdout else ""
+        lines = stripped_stdout.splitlines()
+        version_line = lines[0] if lines else "unknown"
         return DriverResult(success=True, output={"version": version_line})
 
     def _build_command(self, json_out: Path) -> list[str]:
@@ -227,9 +234,24 @@ class K6Driver:
         The Supervisor must never see a raw integer — it must receive a
         structured exception it can route through the Priority state machine.
 
+        Args:
+            code:   The subprocess return code.
+            stderr: The captured stderr text for diagnostic context.
+
+        Returns:
+            None if ``code`` is 0 (success — no alarm needed).
+
         Raises:
-            HamiltonAlarm: Always — the specific message encodes the cause.
+            HamiltonAlarm: For every non-zero code — the specific message
+                           encodes the cause (missing binary, OOM, generic).
         """
+        # Guard against callers passing code=0.  run() only calls
+        # this method on non-zero exits, but the @staticmethod is publicly
+        # accessible.  Without this guard, code=0 falls through to the generic
+        # HamiltonAlarm which is semantically wrong (0 means success).
+        if code == 0:
+            return
+
         if code == _EXIT_NOT_FOUND:
             raise HamiltonAlarm(
                 "k6 binary not found during execution (exit 127). "

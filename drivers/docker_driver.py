@@ -156,9 +156,11 @@ class DockerDriver:
         Translate a non-zero Docker exit code into the correct Hamilton signal.
 
         Raises:
-            EnvError:   On exit 127 (binary not found).
-            BuildError: On all other failures, with OOM context when exit 137.
+            AssertionError: If called with code=0 (logic error).
+            EnvError:       On exit 127 (binary not found).
+            BuildError:     On all other failures, with OOM context when exit 137.
         """
+        assert code != 0, "_map_exit_code should never be called for a successful exit (code 0)"
         if code == _EXIT_NOT_FOUND:
             raise EnvError(
                 "docker binary not found during execution (exit 127). "
@@ -171,9 +173,10 @@ class DockerDriver:
                 "Increase Docker memory limit or simplify the build.",
                 context={"exit_code": code, "oom": True},
             )
+        err_msg = stderr.strip() if stderr else "No error output captured"
         raise BuildError(
-            f"docker build failed with exit code {code}: {stderr.strip()}",
-            context={"exit_code": code, "stderr": stderr},
+            f"docker build failed with exit code {code}: {err_msg}",
+            context={"exit_code": code, "stderr": stderr or ""},
         )
 
     def _run_subprocess(self, cmd: list[str]) -> subprocess.CompletedProcess:
