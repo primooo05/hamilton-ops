@@ -65,6 +65,9 @@ class _FakeDriver:
         # terminate() call tracking for subprocess reaping assertions.
         self.terminate_called = False
 
+    def __call__(self, **kwargs):
+        return self
+
     def run(self):
         if self._raises:
             raise self._raises
@@ -134,7 +137,7 @@ def _make_supervisor(
     registry = _FakeRegistry({
         "k6": k6 or _FakeDriver(),
         "linter": linter or _FakeDriver(),
-        "docker": docker or _FakeDriver(),
+        "docker": docker or _FakeAsyncDriver(),
     })
     return HamiltonSupervisor(config, registry)
 
@@ -258,8 +261,7 @@ async def test_p1_alarm_cancels_p3_but_logs_correctly(tmp_path, bypass_staging):
     config = _make_config(tmp_path)
     sv = _make_supervisor(config, k6=_FakeDriver(raises=alarm), docker=p3_driver)
 
-    with patch("core.supervisor.ConstructionDriver", return_value=p3_driver):
-        report = await sv.ship()
+    report = await sv.ship()
 
     p3 = report.stream_results.get("P3:Construction")
     if p3 is not None:
@@ -291,8 +293,7 @@ async def test_p1_alarm_calls_terminate_on_construction_driver(tmp_path, bypass_
     sv = _make_supervisor(config, k6=_FakeDriver(raises=alarm), docker=p3_driver)
 
     # Inject fake construction driver so _hamilton_kill can find it.
-    with patch("core.supervisor.ConstructionDriver", return_value=p3_driver):
-        report = await sv.ship()
+    report = await sv.ship()
 
     # Either terminate was called (P3 started) or kill fired with no driver ref.
     # The important thing: the system did not leave an un-reaped process.
@@ -377,8 +378,7 @@ async def test_p3_build_error_does_not_abort_mission(tmp_path, bypass_staging):
     config = _make_config(tmp_path)
     sv = _make_supervisor(config, docker=_FakeAsyncDriver(raises=build_err))
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver(raises=build_err)):
-        report = await sv.ship()
+    report = await sv.ship()
 
     # Mission is not fully ABORTED — P3 was the only casualty.
     # (Post-flight may fail due to missing binary, but state ≠ ABORTED from P3.)
@@ -396,8 +396,7 @@ async def test_p3_build_error_records_failed_outcome_in_forensics(tmp_path, bypa
     config = _make_config(tmp_path)
     sv = _make_supervisor(config, docker=_FakeAsyncDriver(raises=build_err))
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver(raises=build_err)):
-        report = await sv.ship()
+    report = await sv.ship()
 
     p3 = report.stream_results.get("P3:Construction")
     if p3 is not None:

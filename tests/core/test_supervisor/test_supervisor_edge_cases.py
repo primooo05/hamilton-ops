@@ -46,6 +46,9 @@ class _FakeDriver:
         self._health_exc = health_exc
         self.terminate_called = False
 
+    def __call__(self, **kwargs):
+        return self
+
     def run(self):
         if self._raises:
             raise self._raises
@@ -174,11 +177,10 @@ async def test_ship_called_twice_does_not_crash(tmp_path, bypass_staging):
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
-        report1 = await sv.ship()
-        # Reset kill_fired so second call behaves as a fresh run
-        sv._kill_fired = False
-        report2 = await sv.ship()
+    report1 = await sv.ship()
+    # Reset kill_fired so second call behaves as a fresh run
+    sv._kill_fired = False
+    report2 = await sv.ship()
 
     assert report1 is not report2  # independent report objects
 
@@ -200,8 +202,7 @@ async def test_all_streams_fail_simultaneously(tmp_path, bypass_staging):
     })
     sv = HamiltonSupervisor(config, registry)
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
-        report = await sv.ship()
+    report = await sv.ship()
 
     # System must settle — either ABORTED or some terminal state.
     assert report.flight_state in (
@@ -288,8 +289,7 @@ async def test_p1_telemetry_stored_in_forensic_report(tmp_path, bypass_staging):
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
-        report = await sv.ship()
+    report = await sv.ship()
 
     assert report.p1_metrics == fake_metrics
 
@@ -315,8 +315,7 @@ async def test_stream_duration_is_positive_after_run(tmp_path, bypass_staging):
     sv = HamiltonSupervisor(config, registry)
     sv._post_flight = AsyncMock()
 
-    with patch("core.supervisor.ConstructionDriver", return_value=_FakeAsyncDriver()):
-        report = await sv.ship()
+    report = await sv.ship()
 
     for name, result in report.stream_results.items():
         assert result.duration_s >= 0.0, (

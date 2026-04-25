@@ -56,8 +56,6 @@ from audit.chain import (
     SBOMGenerationStep,
     SecretScannerStep,
 )
-# Module-level import so tests can patch "core.supervisor.ConstructionDriver".
-from drivers.construction import ConstructionDriver
 
 # --- Python 3.10 Compatibility Layer ---
 import sys
@@ -357,8 +355,8 @@ class HamiltonSupervisor:
             async with TaskGroup() as tg:
                 if self._config.concurrency_strategy == "full":
                     # P1 + P2 + P3 (Parallel)
-                    tg.create_task(self._run_p1_task(), name="P1:Validation")
-                    tg.create_task(self._run_p2_task(), name="P2:Quality")
+                    tg.create_task(self._run_p1_task(stage_path), name="P1:Validation")
+                    tg.create_task(self._run_p2_task(stage_path), name="P2:Quality")
                     tg.create_task(self._run_p3_task(stage_path), name="P3:Construction")
                 
                 elif self._config.concurrency_strategy == "reduced":
@@ -373,15 +371,15 @@ class HamiltonSupervisor:
             if self._config.concurrency_strategy == "reduced":
                 # Start P1 and P2 in parallel, wait for them, then P3
                 async with TaskGroup() as tg:
-                    tg.create_task(self._run_p1_task(), name="P1:Validation")
-                    tg.create_task(self._run_p2_task(), name="P2:Quality")
+                    tg.create_task(self._run_p1_task(stage_path), name="P1:Validation")
+                    tg.create_task(self._run_p2_task(stage_path), name="P2:Quality")
                 # After P1/P2 finish (and pass), start P3
                 await self._run_p3_task(stage_path)
 
             elif self._config.concurrency_strategy == "minimal":
                 # Fully sequential
-                await self._run_p1_task()
-                await self._run_p2_task()
+                await self._run_p1_task(stage_path)
+                await self._run_p2_task(stage_path)
                 await self._run_p3_task(stage_path)
 
         except _ExceptionGroup as eg:
@@ -438,7 +436,7 @@ class HamiltonSupervisor:
                 # No Hamilton signals found; re-raise the entire group.
                 raise eg from None
 
-    async def _run_p1_task(self) -> None:
+    async def _run_p1_task(self, stage_path: str | Path) -> None:
         """
         P1 Validation stream — wraps K6Driver.run() in a thread.
 
@@ -451,7 +449,8 @@ class HamiltonSupervisor:
         start = time.monotonic()
 
         try:
-            k6_driver = self._registry.get("k6")
+            k6_driver_factory = self._registry.get("k6")
+            k6_driver = k6_driver_factory(stage_path=stage_path)
             result = await asyncio.to_thread(k6_driver.run)
             result_slot.outcome = "success"
             # Store raw k6 telemetry for forensic report.
@@ -472,7 +471,7 @@ class HamiltonSupervisor:
         finally:
             result_slot.duration_s = time.monotonic() - start
 
-    async def _run_p2_task(self) -> None:
+    async def _run_p2_task(self, stage_path: str | Path) -> None:
         """
         P2 Quality stream — wraps LinterDriver.run() in a thread.
 
@@ -486,7 +485,8 @@ class HamiltonSupervisor:
         start = time.monotonic()
 
         try:
-            linter_driver = self._registry.get("linter")
+            linter_driver_factory = self._registry.get("linter")
+            linter_driver = linter_driver_factory(stage_path=stage_path)
             await asyncio.to_thread(linter_driver.run)
             result_slot.outcome = "success"
 
@@ -528,15 +528,13 @@ class HamiltonSupervisor:
         self._report.stream_results["P3:Construction"] = result_slot
         start = time.monotonic()
 
-        # Instantiate driver early so _hamilton_kill() can reference it.
-        driver = ConstructionDriver(
-            stage_path=stage_path,
-            image_tag=self._config.image_tag,
-            cache_ref=self._config.cache_ref,
-            project_hash=self._config.project_hash,
-            secrets=self._config.secrets,
-            memory_gb=self._config.docker_memory_gb,
-        )
+        try:
+            docker_driver_factory = self._registry.get("docker")
+            driver = docker_driver_factory(stage_path=stage_path)
+        except Exception as e:
+            result_slot.outcome = "failed"
+            result_slot.exception = e
+            raise
         # Store reference before any await — kill handler needs it.
         self._construction_driver = driver
 

@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import time
 import psutil
 from rich.console import Console
 from rich.panel import Panel
@@ -121,16 +122,27 @@ class Doctor:
         self._check_tool("flake8", ["flake8", "--version"])
 
     def check_registry(self):
-        # TODO: query the DriverRegistry.
-        # We can try to import it to see if it's "registered" in code.
+        from drivers.registry import DriverRegistry
+        from drivers.k6_driver import K6Driver
+        from drivers.linter_driver import LinterDriver
         from drivers.construction import ConstructionDriver
         from core.priorities import Priority
+        from core.exceptions import RegistryError
         
-        self.results.append(DiagnosticResult("Registry", "P1 Validation", "success", "registered"))
-        self.results.append(DiagnosticResult("Registry", "P2 Quality", "success", "registered"))
-        self.results.append(DiagnosticResult("Registry", "P3 Construction", "success", "registered"))
+        reg = DriverRegistry()
+        try:
+            reg.register("k6", Priority.P1_VALIDATION)(K6Driver)
+            reg.register("linter", Priority.P2_QUALITY)(LinterDriver)
+            reg.register("docker", Priority.P3_CONSTRUCTION)(ConstructionDriver)
+            reg.verify_completeness()
+            
+            self.results.append(DiagnosticResult("Registry", "P1 Validation", "success", "registered"))
+            self.results.append(DiagnosticResult("Registry", "P2 Quality", "success", "registered"))
+            self.results.append(DiagnosticResult("Registry", "P3 Construction", "success", "registered"))
+        except RegistryError as e:
+            self.results.append(DiagnosticResult("Registry", "Completeness", "error", str(e)))
 
-    def run_diagnostics(self, fix: bool = False) -> Tuple[HardwareProfile, int, int]:
+    def run_diagnostics(self, fix: bool = False, persist: bool = False) -> Tuple[HardwareProfile, int, int]:
         if fix:
             self.fix_environment()
             
@@ -143,6 +155,16 @@ class Doctor:
         
         errors = len([r for r in self.results if r.status == "error"])
         warnings = len([r for r in self.results if r.status == "warning"])
+        
+        if persist:
+            # Persist state
+            state_file = Path(".hamilton_doctor")
+            status = "pass" if errors == 0 else "fail"
+            with open(state_file, "w") as f:
+                f.write(f"status={status}\n")
+                f.write(f"strategy={profile.strategy.value}\n")
+                f.write(f"ram_gb={profile.ram_gb}\n")
+                f.write(f"last_run={time.time()}\n")
         
         return profile, errors, warnings
 
@@ -214,17 +236,8 @@ class Doctor:
 
 def doctor_cmd(fix: bool = False):
     doc = Doctor()
-    profile, errors, warnings = doc.run_diagnostics(fix=fix)
+    profile, errors, warnings = doc.run_diagnostics(fix=fix, persist=True)
     doc.report()
-    
-    # Persist state (proposed in implementation plan)
-    state_file = Path(".hamilton_doctor")
-    status = "pass" if errors == 0 else "fail"
-    with open(state_file, "w") as f:
-        f.write(f"status={status}\n")
-        f.write(f"strategy={profile.strategy.value}\n")
-        f.write(f"ram_gb={profile.ram_gb}\n")
-        f.write(f"last_run={psutil.time.time()}\n")
     
     if errors > 0:
         raise SystemExit(1)

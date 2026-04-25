@@ -3,6 +3,10 @@ from pathlib import Path
 from typing import Optional
 from rich.console import Console
 
+from cli.doctor import doctor_cmd
+from cli.ship import ship_cmd
+from cli.audit import audit_cmd
+
 app = typer.Typer(
     help="Hamilton-Ops CLI — Validate, Build, and Audit with Priority Awareness",
     add_completion=False,
@@ -30,7 +34,6 @@ def doctor(
     fix: bool = typer.Option(False, "--fix", help="Auto-remediate what is fixable")
 ):
     """Run pre-flight diagnostics to validate hardware and environment."""
-    from cli.doctor import doctor_cmd
     doctor_cmd(fix=fix)
 
 @app.command()
@@ -44,7 +47,6 @@ def ship(
         console.print("[yellow]Skip this and you’ll debug environment issues for hours that doctor would have exposed in seconds.[/yellow]")
         raise typer.Exit(code=1)
     
-    from cli.ship import ship_cmd
     ship_cmd(stage=stage, image_tag=image)
 
 @app.command()
@@ -56,7 +58,6 @@ def audit(
         console.print("[red]Error: `hamilton doctor` must pass before `hamilton audit` is callable.[/red]")
         raise typer.Exit(code=1)
     
-    from cli.audit import audit_cmd
     audit_cmd(artifact_path=artifact)
 
 if __name__ == "__main__":

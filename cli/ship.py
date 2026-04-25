@@ -54,9 +54,22 @@ def ship_cmd(stage: Path, image_tag: Optional[str] = None):
     from core.priorities import Priority
     
     registry = DriverRegistry()
-    registry.register("k6", Priority.P1_VALIDATION)(K6Driver)
-    registry.register("linter", Priority.P2_QUALITY)(LinterDriver)
-    registry.register("docker", Priority.P3_CONSTRUCTION)(ConstructionDriver)
+    registry.register("k6", Priority.P1_VALIDATION)(
+        lambda stage_path=None: K6Driver(script_path=config.k6_script)
+    )
+    registry.register("linter", Priority.P2_QUALITY)(
+        lambda stage_path: LinterDriver(stage_path=stage_path, tool_cmd=config.linter_cmd)
+    )
+    registry.register("docker", Priority.P3_CONSTRUCTION)(
+        lambda stage_path: ConstructionDriver(
+            stage_path=stage_path,
+            image_tag=config.image_tag,
+            cache_ref=config.cache_ref,
+            project_hash=config.project_hash,
+            secrets=config.secrets,
+            memory_gb=config.docker_memory_gb,
+        )
+    )
     
     supervisor = HamiltonSupervisor(config, registry)
     

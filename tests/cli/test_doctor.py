@@ -34,7 +34,7 @@ def test_doctor_writes_state_file(tmp_path, monkeypatch):
     with patch("cli.doctor.subprocess.check_output", return_value=b"1.0.0"):
         with patch("cli.doctor.HardwareProfile.detect", return_value=
         HardwareProfile(cores=4, ram_gb=16.0, is_ssd=True)):
-            doc.run_diagnostics()
+            doc.run_diagnostics(persist=True)
 
     state_file = tmp_path / ".hamilton_doctor"
     assert state_file.exists()
@@ -54,7 +54,7 @@ def test_doctor_writes_fail_status_when_errors_exist(tmp_path, monkeypatch):
                side_effect=FileNotFoundError):  # all tools missing
         with patch("cli.doctor.HardwareProfile.detect", return_value=
         HardwareProfile(cores=4, ram_gb=16.0, is_ssd=True)):
-            doc.run_diagnostics()
+            doc.run_diagnostics(persist=True)
 
     content = (tmp_path / ".hamilton_doctor").read_text()
     assert "status=fail" in content

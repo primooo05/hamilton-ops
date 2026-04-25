@@ -5,12 +5,11 @@ Hamilton-Ops Driver Registry
 The Registry is the central phonebook of the Flight Computer.
 
 Instead of hard-coding which tool to invoke in the Supervisor, every
-driver function is registered here by name. The Supervisor calls
-``registry.get("k6")`` and receives the exact callable it needs —
-fully decoupled from the implementation details of k6 or Docker.
+driver factory function is registered here by name. The Supervisor calls
+``registry.get("k6")`` and receives a factory that produces a ready-to-use driver instance.
 
 Security contract:
-  - Registration is **immutable**: once a driver is recorded, it cannot
+  - Registration is **immutable**: once a driver factory is recorded, it cannot
     be replaced at runtime (the 'No-Hijack' rule).
   - Key lookups are **case-insensitive** for ergonomics, but internally
     stored in lowercase for determinism.
