@@ -229,6 +229,82 @@ async def test_run_clears_proc_reference_after_build_failure(tmp_path):
     assert driver._proc is None
 
 
+def test_check_health_raises_env_error_on_non_rootless_linux():
+    """
+    GAP | check_health(): Rootless is enforced on Linux.
+
+    Contract: On Linux, if Docker is not running rootless, check_health()
+    must raise EnvError. This is scoped to Linux because Docker Desktop
+    on Windows never reports rootless in SecurityOptions even when the
+    underlying WSL2 engine is secure.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=False))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        with patch("drivers.construction.platform.system", return_value="Linux"):
+            driver._run_subprocess = fake_run
+            with pytest.raises(EnvError) as exc_info:
+                driver.check_health()
+
+    assert "rootless" in str(exc_info.value).lower()
+    assert "security_options" in exc_info.value.context
+
+
+def test_check_health_skips_rootless_on_windows():
+    """
+    GAP | check_health(): Rootless check is skipped on Windows.
+
+    Contract: On Windows, Docker Desktop uses WSL2 as its backend and
+    never reports "rootless" in SecurityOptions on the Windows-side socket.
+    check_health() must NOT raise EnvError when platform.system() == "Windows"
+    — even if SecurityOptions contains no rootless entry.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            # Mimics real Docker Desktop on Windows: no "rootless" in SecurityOptions
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=False))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        with patch("drivers.construction.platform.system", return_value="Windows"):
+            driver._run_subprocess = fake_run
+            result = driver.check_health()
+
+    assert result.success is True
+
+
+def test_check_health_windows_logs_skip_reason(caplog):
+    """
+    GAP | check_health(): Windows skip is observable in the log.
+
+    Contract: When the rootless check is bypassed on Windows, an INFO-level
+    log message must be emitted naming Docker Desktop / WSL2 as the reason.
+    This keeps the bypass auditable without hiding it silently.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=False))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
+        with patch("drivers.construction.platform.system", return_value="Windows"):
+            driver._run_subprocess = fake_run
+            with caplog.at_level(logging.INFO, logger="hamilton.drivers.construction"):
+                driver.check_health()
+
+    assert any("Windows" in r.message for r in caplog.records)
+    assert any("rootless check skipped" in r.message for r in caplog.records)
+
+
 def test_check_health_logs_warning_and_continues_on_malformed_json(caplog):
     """
     GAP | check_health(): Degradation on malformed 'docker info' JSON.

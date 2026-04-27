@@ -551,6 +551,10 @@ def test_check_health_raises_env_error_when_not_rootless():
     check_health() must raise EnvError when 'rootless' is absent from
     SecurityOptions, even when the daemon is reachable.
 
+    Scoped to Linux via a platform mock because Docker Desktop on Windows
+    never reports "rootless" in SecurityOptions — even with WSL2 — so the
+    check is intentionally bypassed there. See drivers/construction.py.
+
     This is the most critical branch: a silent pass here would allow
     a root-mode Docker to build production images without detection.
     """
@@ -563,9 +567,10 @@ def test_check_health_raises_env_error_when_not_rootless():
         return _completed(returncode=0, stdout="24.0.0")
 
     with patch("drivers.construction.shutil.which", return_value="/usr/bin/docker"):
-        driver._run_subprocess = fake_run
-        with pytest.raises(EnvError) as exc_info:
-            driver.check_health()
+        with patch("drivers.construction.platform.system", return_value="Linux"):
+            driver._run_subprocess = fake_run
+            with pytest.raises(EnvError) as exc_info:
+                driver.check_health()
 
     assert "rootless" in str(exc_info.value).lower()
 

@@ -174,6 +174,8 @@ def test_check_health_raises_env_error_when_not_rootless():
     """
     Contract: Hamilton-Ops requires rootless Docker (README security requirement).
     check_health() must raise EnvError when the daemon is running as root.
+    Only enforced on non-Windows hosts — Docker Desktop on Windows never
+    reports "rootless" in SecurityOptions even when backed by WSL2.
     """
     driver = _make_driver()
 
@@ -183,12 +185,37 @@ def test_check_health_raises_env_error_when_not_rootless():
         return _completed(returncode=0, stdout="24.0.0")
 
     with patch("drivers.docker_driver.shutil.which", return_value="/usr/bin/docker"):
-        driver._run_subprocess = fake_run
-        with pytest.raises(EnvError) as exc_info:
-            driver.check_health()
+        with patch("drivers.docker_driver.platform.system", return_value="Linux"):
+            driver._run_subprocess = fake_run
+            with pytest.raises(EnvError) as exc_info:
+                driver.check_health()
 
     assert "rootless" in str(exc_info.value).lower()
     assert "name=apparmor" in exc_info.value.context["security_options"]
+
+
+def test_check_health_skips_rootless_on_windows():
+    """
+    Contract: On Windows, Docker Desktop uses WSL2 as its backend and does NOT
+    report "rootless" in SecurityOptions on the Windows-side socket — even though
+    the underlying engine is secure. check_health() must pass without raising
+    EnvError when platform.system() == "Windows".
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            # Windows Docker Desktop — no "rootless" in SecurityOptions
+            return _completed(returncode=0, stdout=_docker_info_json(rootless=False))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.docker_driver.shutil.which", return_value="/usr/bin/docker"):
+        with patch("drivers.docker_driver.platform.system", return_value="Windows"):
+            driver._run_subprocess = fake_run
+            # Must NOT raise — the check is intentionally skipped on Windows
+            result = driver.check_health()
+
+    assert result.success is True
 
 
 def test_check_health_passes_when_rootless():

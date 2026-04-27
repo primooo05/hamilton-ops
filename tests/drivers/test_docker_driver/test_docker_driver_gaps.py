@@ -91,8 +91,9 @@ def test_check_health_raises_env_error_on_empty_security_options():
     """
     GAP | check_health(): Edge case — SecurityOptions is an empty list.
 
-    Contract: If SecurityOptions is empty, the rootless check should fail
-    with an explicit EnvError.
+    Contract: If SecurityOptions is empty, the rootless check must fail
+    with an explicit EnvError. Scoped to Linux — Windows bypasses this
+    check entirely because Docker Desktop never reports rootless there.
     """
     driver = _make_driver()
 
@@ -102,12 +103,37 @@ def test_check_health_raises_env_error_on_empty_security_options():
         return _completed(returncode=0, stdout="24.0.0")
 
     with patch("drivers.docker_driver.shutil.which", return_value="/usr/bin/docker"):
-        driver._run_subprocess = fake_run
-        with pytest.raises(EnvError) as exc_info:
-            driver.check_health()
+        with patch("drivers.docker_driver.platform.system", return_value="Linux"):
+            driver._run_subprocess = fake_run
+            with pytest.raises(EnvError) as exc_info:
+                driver.check_health()
 
     assert "rootless" in str(exc_info.value).lower()
     assert exc_info.value.context["security_options"] == []
+
+
+def test_check_health_windows_bypasses_empty_security_options():
+    """
+    GAP | check_health(): Windows + empty SecurityOptions.
+
+    Contract: On Windows, even an empty SecurityOptions list must NOT raise
+    EnvError — the rootless check is skipped entirely because Docker Desktop
+    on Windows does not populate this field from the Windows-side daemon.
+    """
+    driver = _make_driver()
+
+    def fake_run(cmd):
+        if "info" in cmd:
+            # Docker Desktop on Windows: SecurityOptions is empty
+            return _completed(returncode=0, stdout=json.dumps({"SecurityOptions": []}))
+        return _completed(returncode=0, stdout="24.0.0")
+
+    with patch("drivers.docker_driver.shutil.which", return_value="/usr/bin/docker"):
+        with patch("drivers.docker_driver.platform.system", return_value="Windows"):
+            driver._run_subprocess = fake_run
+            result = driver.check_health()
+
+    assert result.success is True
 
 
 def test_check_health_exact_commands_passed_to_subprocess():

@@ -24,6 +24,7 @@ Error-mapping contract:
 from __future__ import annotations
 
 import logging
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -115,11 +116,20 @@ class DockerDriver:
         try:
             info = _json.loads(info_result.stdout)
             security_options: list = info.get("SecurityOptions", [])
-            if not any("rootless" in opt for opt in security_options):
-                raise EnvError(
-                    "Docker is running as root. Hamilton-Ops requires rootless mode. "
-                    "See https://docs.docker.com/engine/security/rootless/",
-                    context={"security_options": security_options},
+            # On Windows, Docker Desktop uses WSL2 as its backend.
+            # The Windows-side daemon never reports "rootless" in SecurityOptions
+            # even when the underlying engine is rootless. Skip the check on Windows.
+            if platform.system() != "Windows":
+                if not any("rootless" in opt for opt in security_options):
+                    raise EnvError(
+                        "Docker is running as root. Hamilton-Ops requires rootless mode. "
+                        "See https://docs.docker.com/engine/security/rootless/",
+                        context={"security_options": security_options},
+                    )
+            else:
+                logger.info(
+                    "DOCKER: Windows detected — rootless check skipped "
+                    "(Docker Desktop uses WSL2 backend)."
                 )
         except _json.JSONDecodeError:
             # Non-fatal: if we can't parse the JSON we skip the rootless check
