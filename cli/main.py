@@ -1,6 +1,6 @@
 import typer
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from rich.console import Console
 
 from cli.doctor import doctor_cmd
@@ -18,7 +18,7 @@ def check_doctor_passed() -> bool:
     state_file = Path(".hamilton_doctor")
     if not state_file.exists():
         return False
-    
+
     try:
         with open(state_file, "r") as f:
             lines = f.readlines()
@@ -40,14 +40,44 @@ def doctor(
 def ship(
     stage: Path = typer.Option(Path("."), "--stage", help="Path to project stage"),
     image: Optional[str] = typer.Option(None, "--image", help="Custom image tag"),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        help="Project name for forensics. Defaults to the current directory name.",
+    ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Escalate QualityViolation to Hamilton Kill (P1 abort).",
+    ),
+    linter_cmd: Optional[List[str]] = typer.Option(
+        None,
+        "--linter-cmd",
+        help=(
+            "Custom linter command. Pass each token separately: "
+            "--linter-cmd eslint --linter-cmd '--ext' --linter-cmd '.js'"
+        ),
+    ),
+    cache_ref: Optional[str] = typer.Option(
+        None,
+        "--cache-ref",
+        help="BuildKit registry cache reference, e.g. ghcr.io/org/app:buildcache",
+    ),
 ):
     """Execute the P1/P2/P3 build and validation streams."""
     if not check_doctor_passed():
         console.print("[red]Error: `hamilton doctor` must pass before `hamilton ship` is callable.[/red]")
-        console.print("[yellow]Skip this and you’ll debug environment issues for hours that doctor would have exposed in seconds.[/yellow]")
+        console.print("[yellow]Skip this and you'll debug environment issues for hours that doctor would have exposed in seconds.[/yellow]")
         raise typer.Exit(code=1)
-    
-    ship_cmd(stage=stage, image_tag=image)
+
+    ship_cmd(
+        stage=stage,
+        image_tag=image,
+        project=project,
+        strict=strict,
+        linter_cmd=linter_cmd or None,
+        cache_ref=cache_ref,
+    )
 
 @app.command()
 def audit(
@@ -57,8 +87,9 @@ def audit(
     if not check_doctor_passed():
         console.print("[red]Error: `hamilton doctor` must pass before `hamilton audit` is callable.[/red]")
         raise typer.Exit(code=1)
-    
+
     audit_cmd(artifact_path=artifact)
 
 if __name__ == "__main__":
     app()
+

@@ -122,20 +122,33 @@ class Doctor:
         self._check_tool("flake8", ["flake8", "--version"])
 
     def check_registry(self):
-        from drivers.registry import DriverRegistry
-        from drivers.k6_driver import K6Driver
-        from drivers.linter_driver import LinterDriver
-        from drivers.construction import ConstructionDriver
-        from core.priorities import Priority
+        """Validate registry completeness using the same wiring as ship_cmd.
+
+        Imports ``build_registry`` from ``cli.ship`` and calls
+        ``verify_completeness()`` on the result. This guarantees that the
+        doctor is testing the *actual* runtime registry — not a parallel one
+        that could diverge from the real wiring over time.
+        """
+        from cli.ship import build_registry
+        from core.supervisor import SupervisorConfig
         from core.exceptions import RegistryError
-        
-        reg = DriverRegistry()
+
+        # Construct a minimal config so build_registry can resolve all factories.
+        # Paths and script names don't need to exist — we're only checking that
+        # the registry has all three pillars wired at the correct priorities,
+        # not that the tools can actually run (that's check_software()'s job).
+        mock_config = SupervisorConfig(
+            project_name="doctor-check",
+            source_path=Path("."),
+            image_tag="hamilton/check:latest",
+            binary_path="dist/app.bin",
+            k6_script="tests/p1_validation.js",
+        )
+
         try:
-            reg.register("k6", Priority.P1_VALIDATION)(K6Driver)
-            reg.register("linter", Priority.P2_QUALITY)(LinterDriver)
-            reg.register("docker", Priority.P3_CONSTRUCTION)(ConstructionDriver)
+            reg = build_registry(mock_config)
             reg.verify_completeness()
-            
+
             self.results.append(DiagnosticResult("Registry", "P1 Validation", "success", "registered"))
             self.results.append(DiagnosticResult("Registry", "P2 Quality", "success", "registered"))
             self.results.append(DiagnosticResult("Registry", "P3 Construction", "success", "registered"))

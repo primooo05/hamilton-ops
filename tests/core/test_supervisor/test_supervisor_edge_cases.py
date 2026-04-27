@@ -236,10 +236,6 @@ async def test_hamilton_kill_safe_when_no_construction_driver(tmp_path):
     assert sv._kill_fired is True
 
 
-# ---------------------------------------------------------------------------
-# cleanup_ok = False when _reap_all raises internally
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_cleanup_failure_sets_cleanup_ok_false(tmp_path, bypass_staging):
     """
@@ -267,9 +263,6 @@ async def test_cleanup_failure_sets_cleanup_ok_false(tmp_path, bypass_staging):
     assert report.cleanup_ok is False
 
 
-# ---------------------------------------------------------------------------
-# P1 metrics stored in forensic report
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_p1_telemetry_stored_in_forensic_report(tmp_path, bypass_staging):
@@ -294,9 +287,6 @@ async def test_p1_telemetry_stored_in_forensic_report(tmp_path, bypass_staging):
     assert report.p1_metrics == fake_metrics
 
 
-# ---------------------------------------------------------------------------
-# Stream duration is always recorded
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_stream_duration_is_positive_after_run(tmp_path, bypass_staging):
@@ -321,3 +311,79 @@ async def test_stream_duration_is_positive_after_run(tmp_path, bypass_staging):
         assert result.duration_s >= 0.0, (
             f"Stream '{name}' has negative duration — finally block not reached."
         )
+
+
+@pytest.mark.asyncio
+async def test_preflight_calls_check_health_on_driver_instance_not_factory(
+    tmp_path, bypass_staging
+):
+    """
+    Contract: _pre_flight must instantiate drivers from factories before
+    calling check_health(). Calling check_health() on a lambda raises
+    AttributeError — this test catches any regression.
+
+    The test injects a factory spy (a callable that records how it was
+    called and returns a real _FakeDriver instance). It then asserts:
+        1. The factory was called with stage_path=None (Phase 1 invocation).
+        2. check_health() was called on the *returned instance*, not the spy.
+        3. No AttributeError was raised (the factory lambda has no check_health).
+
+    If _pre_flight regresses to calling check_health() directly on the factory
+    callable (the old bug), this test will fail with AttributeError because
+    lambdas do not have a check_health attribute.
+    """
+    health_check_calls = []
+
+    class _SpyDriver:
+        """A driver that records when check_health() is called on it."""
+        def check_health(self):
+            health_check_calls.append("check_health called on instance")
+            return SimpleNamespace(success=True, output={"version": "spy"})
+
+        def run(self):
+            return SimpleNamespace(success=True, output={})
+
+        async def terminate(self):
+            pass
+
+    factory_calls = []
+
+    def _spy_factory(stage_path=None):
+        """Factory spy: records the stage_path it was called with."""
+        factory_calls.append(stage_path)
+        return _SpyDriver()
+
+    registry = _FakeRegistry({
+        "k6":     _spy_factory,
+        "linter": _spy_factory,
+        "docker": _spy_factory,
+    })
+
+    config = _make_config(tmp_path)
+    sv = HamiltonSupervisor(config, registry)
+    # Skip the actual launch — we only care about _pre_flight behavior.
+    sv._launch = AsyncMock()
+    sv._post_flight = AsyncMock()
+
+    await sv.ship()
+
+    # Phase 1 factories must have been called with stage_path=None (one per driver).
+    # The factory may also be called with a real path in Phase 2 (launch),
+    # but the first three calls from _pre_flight must all be with None.
+    assert len(factory_calls) >= 3, (
+        f"Expected at least 3 factory calls (one per driver for health checks), "
+        f"got {len(factory_calls)}."
+    )
+    # All health-check Phase 1 calls must have stage_path=None.
+    preflight_calls = factory_calls[:3]
+    assert all(p is None for p in preflight_calls), (
+        f"_pre_flight must call factory(stage_path=None) for health checks. "
+        f"Got: {preflight_calls}"
+    )
+
+    # check_health() must have been called on the returned instances.
+    assert len(health_check_calls) == 3, (
+        f"Expected check_health() called 3 times (one per driver), "
+        f"got {len(health_check_calls)}."
+    )
+

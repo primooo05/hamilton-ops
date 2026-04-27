@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from exceptiongroup import ExceptionGroup, BaseExceptionGroup
+
 from core.exceptions import (
     BuildError,
     EnvError,
@@ -66,7 +68,6 @@ if sys.version_info >= (3, 11):
 else:
     # Use standard Exception as a catch-all if ExceptionGroup isn't available
     try:
-        from exceptiongroup import ExceptionGroup, BaseExceptionGroup
         _ExceptionGroup = (ExceptionGroup, BaseExceptionGroup)
     except ImportError:
         class ExceptionGroup(Exception):
@@ -310,14 +311,32 @@ class HamiltonSupervisor:
 
         # Run health checks on all three drivers before staging begins.
         # EnvError from any check surfaces here and terminates in ship().
+        #
+        # Two-phase factory invocation:
+        #   Phase 1 (here)  — call factory(stage_path=None) to get an instance
+        #                     for health checking. stage_path is not yet known
+        #                     because staging hasn't run. Drivers must handle
+        #                     None gracefully in __init__ (they all do — health
+        #                     checks only probe the binary, not the target path).
+        #   Phase 2 (tasks) — call factory(stage_path=real_path) inside each
+        #                     stream task after staging completes.
+        #
+        # The registry stores factories (callables), NOT instances. Calling
+        # check_health() directly on registry.get("k6") would call it on the
+        # lambda, not a driver — raising AttributeError.
         logger.info("SUPERVISOR [PRE-FLIGHT]: Running driver health checks.")
-        k6_driver_cls = self._registry.get("k6")
-        linter_driver_cls = self._registry.get("linter")
-        docker_driver_cls = self._registry.get("docker")
+        k6_factory = self._registry.get("k6")
+        linter_factory = self._registry.get("linter")
+        docker_factory = self._registry.get("docker")
 
-        await asyncio.to_thread(lambda: k6_driver_cls.check_health())
-        await asyncio.to_thread(lambda: linter_driver_cls.check_health())
-        await asyncio.to_thread(lambda: docker_driver_cls.check_health())
+        # Instantiate health-check instances (stage_path=None → Phase 1).
+        k6_health     = k6_factory(stage_path=None)
+        linter_health = linter_factory(stage_path=None)
+        docker_health = docker_factory(stage_path=None)
+
+        await asyncio.to_thread(k6_health.check_health)
+        await asyncio.to_thread(linter_health.check_health)
+        await asyncio.to_thread(docker_health.check_health)
 
         # Stage the source — this creates an immutable snapshot.
         logger.info("SUPERVISOR [PRE-FLIGHT]: Staging source at %s", self._config.source_path)
