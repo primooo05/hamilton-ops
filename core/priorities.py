@@ -28,7 +28,7 @@ class Priority(Enum):
 @dataclass(frozen=True)
 class FlightThresholds:
     """
-    Read-only P1 telemetry thresholds loaded from .hamilton.toml.
+    Read-only P1 telemetry thresholds loaded from pyproject.toml.
     Frozen post-construction to prevent mid-flight mutation.
 
     Defaults match the baseline in the Hamilton-Ops specification:

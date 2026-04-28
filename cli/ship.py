@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from rich.console import Console
 
+from core.config import compute_project_hash, load_hamilton_config
 from core.supervisor import HamiltonSupervisor, SupervisorConfig
 from core.priorities import Priority
 
@@ -153,31 +154,59 @@ def ship_cmd(
     # always meaningful even when --project is omitted.
     project_name = project or Path(stage).resolve().name
 
+    toml_config = load_hamilton_config(stage)
+    toml_project = toml_config.get("project", {})
+    toml_construction = toml_config.get("construction", {})
+
+    # Resolve final values: CLI arg wins, then TOML, then hardcoded default.
+    resolved_image_tag  = image_tag  or toml_project.get("image_tag",  "hamilton/app:latest")
+    resolved_cache_ref  = cache_ref  or toml_project.get("cache_ref",  None)
+    resolved_k6_script  = toml_project.get("k6_script", "tests/p1_validation.js")
+    resolved_linter_cmd = linter_cmd or None  # TOML linter override not modelled yet
+
     console.print(f"SUPERVISOR: Detected execution strategy: [bold cyan]{strategy}[/bold cyan]")
     console.print(f"SUPERVISOR: Project: [bold]{project_name}[/bold]")
     if strict:
         console.print("SUPERVISOR: [bold red]--strict mode enabled[/bold red] — QualityViolation will escalate to Hamilton Kill.")
 
     # Adaptive resource capping based on detected RAM.
-    docker_memory = 4  # Default 4GB
+    docker_memory = toml_construction.get("memory_gb", 4)
     if ram_gb < 8:
-        docker_memory = 3  # Cap at 3GB for low-RAM hosts
+        docker_memory = min(docker_memory, 3)  # Cap at 3GB for low-RAM hosts
         console.print(
             f"SUPERVISOR: [yellow]Low RAM detected ({ram_gb:.1f}GB). "
             f"Capping Docker at {docker_memory}GB.[/yellow]"
         )
 
+    # -------------------------------------------------------------------
+    # Compute LOCKFILE_HASH for BuildKit cache scoping.
+    # This fingerprints the project's dependency manifests so the BuildKit
+    # layer cache is namespaced per unique dependency state, preventing
+    # cross-project cache contamination on shared CI runners.
+    # -------------------------------------------------------------------
+    resolved_stage = Path(stage).resolve()
+    project_hash = compute_project_hash(resolved_stage)
+    if project_hash:
+        console.print(
+            f"SUPERVISOR: LOCKFILE_HASH=[cyan]{project_hash}[/cyan] — BuildKit cache scoped."
+        )
+    else:
+        console.print(
+            "SUPERVISOR: [yellow]No lockfile found — BuildKit cache will not be scoped.[/yellow]"
+        )
+
     config = SupervisorConfig(
         project_name=project_name,
         source_path=stage,
-        image_tag=image_tag or "hamilton/app:latest",
+        image_tag=resolved_image_tag,
         binary_path="dist/app.bin",
-        k6_script="tests/p1_validation.js",
+        k6_script=resolved_k6_script,
         strict=strict,
         concurrency_strategy=strategy,
         docker_memory_gb=docker_memory,
-        linter_cmd=linter_cmd,
-        cache_ref=cache_ref,
+        linter_cmd=resolved_linter_cmd,
+        cache_ref=resolved_cache_ref,
+        project_hash=project_hash or None,  # pass None if empty — driver skips flag
     )
 
     registry = build_registry(config)

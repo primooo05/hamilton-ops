@@ -61,7 +61,7 @@ class K6Driver:
         Args:
             script_path: Absolute path to the k6 JavaScript test script.
                          May contain spaces — the driver ensures correct quoting.
-            thresholds:  Frozen flight thresholds loaded from .hamilton.toml.
+            thresholds:  Frozen flight thresholds loaded from pyproject.toml.
                          Defaults to the spec baseline if not provided.
             target:      Injection point for the TARGET environment variable.
                          Defaults to localhost to prevent accidental DDoS.

@@ -113,6 +113,216 @@ _SECRET_LINE_PATTERN = re.compile(
     r"(?i)(password|passwd|pwd|secret|token|api[_\-]?key|auth|credential)\s*[=:]\s*\S+",
 )
 
+# ---------------------------------------------------------------------------
+# Package-manager install commands that must appear AFTER dependency manifests
+# are COPYed in a Dockerfile. Detecting ``COPY .`` before these commands means
+# every source-code change busts the expensive install layer.
+# ---------------------------------------------------------------------------
+_INSTALL_COMMANDS: frozenset[str] = frozenset([
+    "npm install",
+    "npm ci",
+    "yarn install",
+    "yarn",
+    "pnpm install",
+    "pip install",
+    "pip3 install",
+    "poetry install",
+    "cargo build",
+    "cargo fetch",
+    "mvn install",
+    "mvn package",
+    "gradle build",
+    "go mod download",
+    "bundle install",
+])
+
+
+class DockerfileAnalyzer:
+    """
+    Static pre-build Dockerfile layer analyser.
+
+    Parses the Dockerfile *before* handing off to Docker so that common
+    caching anti-patterns are caught as a clean EnvError rather than a
+    silent cache miss that inflates CI build time from ~40 s to ~500 s.
+
+    Anti-pattern detected — ``COPY .`` before dependency install
+    ---------------------------------------------------------------
+    When a Dockerfile copies the entire source tree (``COPY . .``,
+    ``COPY . /app``, etc.) before running a package-manager install
+    command, every single source-code change invalidates the dependency
+    install layer, forcing a full reinstall on every commit.
+
+    Correct pattern::
+
+        COPY package*.json ./       ← copy manifests only
+        RUN npm ci                  ← install deps (cached layer)
+        COPY . .                    ← copy source (busts ONLY the upper layers)
+
+    The analyser raises EnvError with the offending line numbers so the
+    developer can fix the Dockerfile before wasting CI minutes.
+
+    Limitations:
+        - Only the outermost ``FROM … AS`` stage is analysed (multi-stage
+          Dockerfiles have many stages; future work can extend per-stage).
+        - ``COPY --from=…`` (cross-stage copies) are ignored — they do not
+          represent the live source tree.
+        - ``ADD`` is not flagged: it is rarely used for source trees, and
+          its URL-download form would produce false positives.
+        - Comments and blank lines are stripped before analysis.
+    """
+
+    def __init__(self, dockerfile_path: Path) -> None:
+        """
+        Args:
+            dockerfile_path: Absolute path to the Dockerfile to analyse.
+        """
+        self._path = dockerfile_path
+
+    def analyze(self) -> None:
+        """
+        Perform static layer analysis on the Dockerfile.
+
+        Raises:
+            EnvError: If a ``COPY .`` instruction precedes a package-manager
+                      install command in the same build stage.
+        """
+        try:
+            lines = self._path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            # File access error — let the existing Dockerfile-existence guard
+            # in run() surface a cleaner message; just log here.
+            logger.debug("ANALYZER: Could not read Dockerfile at %s: %s", self._path, exc)
+            return
+
+        violations = self._detect_copy_before_install(lines)
+        if violations:
+            detail = "; ".join(
+                f"line {lineno}: '{snippet}'" for lineno, snippet in violations
+            )
+            raise EnvError(
+                f"Dockerfile layer cache anti-pattern detected in '{self._path}'. "
+                f"A 'COPY .' instruction appears before a package-manager install command. "
+                f"This busts the dependency cache on every source change. "
+                f"Move 'COPY .' AFTER the install step. "
+                f"Offending location(s): {detail}",
+                context={
+                    "dockerfile": str(self._path),
+                    "violations": [(n, s) for n, s in violations],
+                },
+            )
+
+        logger.debug("ANALYZER: Dockerfile %s passed layer-cache analysis.", self._path)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _detect_copy_before_install(self, lines: list[str]) -> list[tuple[int, str]]:
+        """
+        Scan logical Dockerfile instructions for ``COPY .`` before install.
+
+        Returns a list of (line_number, snippet) pairs for each COPY . that
+        precedes an install command in the same stage. Empty list = clean.
+
+        Implementation notes:
+            - Line numbers are 1-indexed to match editor/IDE conventions.
+            - Continuation lines (trailing backslash) are joined so that a
+              multi-line RUN command is analysed as a single unit.
+            - ``COPY --from=…`` (cross-stage) is explicitly excluded.
+            - Resets ``pending_copy_dots`` on each new ``FROM`` so that
+              multi-stage builds are evaluated per-stage.
+        """
+        # Join continuation lines into logical instructions.
+        logical: list[tuple[int, str]] = []  # (first_line_no, instruction)
+        buf: list[str] = []
+        start_lineno = 1
+
+        for lineno, raw in enumerate(lines, start=1):
+            stripped = raw.strip()
+            # Skip comments and blanks.
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not buf:
+                start_lineno = lineno
+            buf.append(stripped.rstrip("\\"))
+            if not stripped.endswith("\\"):
+                logical.append((start_lineno, " ".join(buf).strip()))
+                buf = []
+
+        if buf:
+            # Unterminated continuation at EOF — flush anyway.
+            logical.append((start_lineno, " ".join(buf).strip()))
+
+        violations: list[tuple[int, str]] = []
+        # Track line numbers of COPY . instructions seen in the current stage
+        # that have NOT yet been followed by an install command.
+        pending_copy_dots: list[tuple[int, str]] = []
+
+        for lineno, instruction in logical:
+            upper = instruction.upper()
+
+            if upper.startswith("FROM "):
+                # New stage — reset pending tracker.
+                pending_copy_dots = []
+                continue
+
+            if self._is_copy_dot(instruction):
+                pending_copy_dots.append((lineno, instruction))
+                continue
+
+            if pending_copy_dots and self._is_install_command(instruction):
+                # Install command found AFTER a COPY . — this is the violation.
+                violations.extend(pending_copy_dots)
+                # Reset so subsequent install calls don't re-flag the same COPY.
+                pending_copy_dots = []
+
+        return violations
+
+    @staticmethod
+    def _is_copy_dot(instruction: str) -> bool:
+        """
+        Return True if ``instruction`` is a broad source-tree COPY.
+
+        Patterns matched:
+            COPY . .
+            COPY . /app
+            COPY . ./
+            COPY . /
+
+        Patterns NOT matched:
+            COPY --from=builder /app/dist /app/dist   (cross-stage, ignored)
+            COPY package.json ./                       (specific file, fine)
+            COPY src/ /app/src                         (specific dir, fine)
+        """
+        # Normalise whitespace for reliable splitting.
+        parts = instruction.split()
+        if len(parts) < 3:
+            return False
+        if parts[0].upper() != "COPY":
+            return False
+        # Skip cross-stage copies entirely — ``--from=`` as the first real arg.
+        if parts[1].startswith("--"):
+            return False
+        # The source argument is parts[1]; flag it if it is exactly ".".
+        return parts[1] == "."
+
+    @staticmethod
+    def _is_install_command(instruction: str) -> bool:
+        """
+        Return True if ``instruction`` contains a known package-manager install.
+
+        Matches are substring-based (using ``in``) so that flags and
+        subcommands (e.g., ``npm ci --legacy-peer-deps``) are still detected.
+        """
+        # Strip the leading RUN keyword if present so we check the command body.
+        body = instruction
+        if body.upper().startswith("RUN "):
+            body = body[4:].strip()
+
+        lower_body = body.lower()
+        return any(cmd in lower_body for cmd in _INSTALL_COMMANDS)
+
+
 
 class ConstructionDriver:
     """
@@ -230,6 +440,12 @@ class ConstructionDriver:
                 "Verify the staging directory and dockerfile path are correct.",
                 context={"dockerfile": str(self.dockerfile)},
             )
+
+        # --- Static Dockerfile layer analysis ---
+        # Run the analyser BEFORE spawning any subprocess so that a
+        # cache anti-pattern (COPY . before npm install) is caught as a
+        # clean EnvError rather than a slow cache-miss build failure.
+        DockerfileAnalyzer(self.dockerfile).analyze()
 
         cmd = self._build_command()
         safe_cmd = _redact_build_args(cmd)
