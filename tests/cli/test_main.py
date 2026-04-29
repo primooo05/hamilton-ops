@@ -5,6 +5,16 @@ from cli.main import app
 
 runner = CliRunner()
 
+def test_ship_displays_banner(tmp_path, monkeypatch):
+    """
+    Contract: hamilton ship must display the schematic banner immediately.
+    """
+    monkeypatch.chdir(tmp_path)
+    # Even if it fails doctor check, banner should show
+    result = runner.invoke(app, ["ship"])
+    assert "Welcome to Hamilton-Ops" in result.output
+    assert "HAMILTON" in result.output
+
 def test_ship_blocked_without_doctor(tmp_path, monkeypatch):
     """
     Contract: hamilton ship must exit code 1 if .hamilton_doctor

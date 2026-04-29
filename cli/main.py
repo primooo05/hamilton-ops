@@ -65,6 +65,9 @@ def ship(
     ),
 ):
     """Execute the P1/P2/P3 build and validation streams."""
+    from cli.ui import print_schematic_banner
+    print_schematic_banner()
+
     if not check_doctor_passed():
         console.print("[red]Error: `hamilton doctor` must pass before `hamilton ship` is callable.[/red]")
         console.print("[yellow]Skip this and you'll debug environment issues for hours that doctor would have exposed in seconds.[/yellow]")
