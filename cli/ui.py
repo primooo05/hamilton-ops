@@ -1,37 +1,39 @@
+import time
+from pyfiglet import Figlet
 from rich.console import Console
+from rich.panel import Panel
+from rich.align import Align
 from rich.text import Text
 
-def print_schematic_banner():
-    """Display the Hamilton-Ops schematic ASCII banner.
-    
-    This banner uses high-contrast cyan for the 'blocks' and dim white for
-    the 'wires', creating a technical, flight-ready aesthetic.
-    """
+def type_text(text: str, style: str = "bold white", delay: float = 0.02):
+    console = Console()
+    for char in text:
+        console.print(char, style=style, end="")
+        time.sleep(delay)
+    console.print()
+
+def print_welcome_panel():
     console = Console()
     
-    # We use different colors for the 'Blocks' and the 'Wires' (lines)
-    # Style: Blocks = bold cyan, Wires = dim white or grey
-    raw_art = [
-        "       │██   ██  █████ │███   │███ ██ ██│     ████████│ ██████│ ███│   ██│",
-        "       │██   ██│██   ██│████  ████ ██ ██│        ██│── ██    ██│████│  ██│",
-        "       │███████│███████│██ ████│██ ██ ██│        ██│   ██    ██│██ ██│ ██│",
-        "       │██   ██│██  │██│██  ██ │██ ██ ██│        ██│   ██    ██│██  ██│██│",
-        "       │██   ██│██  │██│██     │██ ██ ███████│   ██│    ██████│ ██   ████│"
-    ]
+    fig = Figlet(font="ansi_shadow")
+    art = fig.renderText("HAMILTON")
 
-    # Display the title first to give context to the ASCII art
-    title = "[bold white]Welcome to Hamilton-Ops[/]\n[bold blue]HAMILTON[/]\n[dim]Flight-ready Command Interface[/]\n"
-    console.print(title)
+    title = Text()
+    title.append("Welcome to Hamilton-Ops\n", style="bold white")
+    title.append("Flight-ready Command Interface", style="dim")
 
-    styled_banner = Text()
-    for line in raw_art:
-        for char in line:
-            if char in "│─":
-                styled_banner.append(char, style="dim white")
-            elif char == "█":
-                styled_banner.append(char, style="bold cyan")
-            else:
-                styled_banner.append(char)
-        styled_banner.append("\n")
+    welcome = Align.center(
+        Panel.fit(
+            f"[bold cyan]{art}[/]\n{title}",
+            border_style="blue",
+            padding=(1, 4),
+            title="[bold]hamilton-ops v0.1[/]",
+            subtitle="[dim]type 'help' or ask naturally[/]"
+        )
+    )
 
-    console.print(styled_banner)
+    console.print(welcome)
+    console.print("[dim]Session memory: on • cwd: ./ops[/]\n")
+    
+    # Example prompts to guide the user
+    console.print("[bold cyan]Try:[/bold cyan] [dim]\"check staging health\" • \"rollback last deploy\" • \"/help\"[/]\n")

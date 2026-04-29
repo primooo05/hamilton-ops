@@ -2,6 +2,7 @@ import typer
 from pathlib import Path
 from typing import List, Optional
 from rich.console import Console
+from rich.prompt import Confirm
 
 from cli.doctor import doctor_cmd
 from cli.ship import ship_cmd
@@ -63,15 +64,27 @@ def ship(
         "--cache-ref",
         help="BuildKit registry cache reference, e.g. ghcr.io/org/app:buildcache",
     ),
+    programmatic: bool = typer.Option(
+        False,
+        "--programmatic",
+        "-p",
+        help="Run without interactive confirmation prompt.",
+    ),
 ):
     """Execute the P1/P2/P3 build and validation streams."""
-    from cli.ui import print_schematic_banner
-    print_schematic_banner()
+    from cli.ui import print_welcome_panel, type_text
+    print_welcome_panel()
 
     if not check_doctor_passed():
         console.print("[red]Error: `hamilton doctor` must pass before `hamilton ship` is callable.[/red]")
         console.print("[yellow]Skip this and you'll debug environment issues for hours that doctor would have exposed in seconds.[/yellow]")
         raise typer.Exit(code=1)
+
+    if not programmatic:
+        type_text(f"Mission Plan: Execute P1/P2/P3 streams for project [bold]{project or stage.resolve().name}[/bold].", delay=0.01)
+        if not Confirm.ask("[bold yellow]Ready for ignition?[/bold yellow]", default=False):
+            console.print("[dim]Aborted by user.[/dim]")
+            raise typer.Exit(code=0)
 
     ship_cmd(
         stage=stage,

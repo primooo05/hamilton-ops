@@ -7,13 +7,14 @@ runner = CliRunner()
 
 def test_ship_displays_banner(tmp_path, monkeypatch):
     """
-    Contract: hamilton ship must display the schematic banner immediately.
+    Contract: hamilton ship must display the welcome panel immediately.
     """
     monkeypatch.chdir(tmp_path)
     # Even if it fails doctor check, banner should show
-    result = runner.invoke(app, ["ship"])
+    # Use -p to avoid hanging on prompt in tests
+    result = runner.invoke(app, ["ship", "-p"])
     assert "Welcome to Hamilton-Ops" in result.output
-    assert "HAMILTON" in result.output
+    assert "v0.1" in result.output
 
 def test_ship_blocked_without_doctor(tmp_path, monkeypatch):
     """
@@ -25,17 +26,31 @@ def test_ship_blocked_without_doctor(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "hamilton doctor" in result.output.lower()
 
-def test_ship_allowed_after_doctor_passes(tmp_path, monkeypatch):
+def test_ship_allowed_after_doctor_passes_programmatic(tmp_path, monkeypatch):
     """
-    Contract: ship proceeds when .hamilton_doctor contains status=pass.
+    Contract: ship proceeds when .hamilton_doctor contains status=pass in programmatic mode.
     """
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".hamilton_doctor").write_text("status=pass\nstrategy=full\nram_gb=16.0\n")
 
     # Mock ship_cmd so we don't actually build anything
     with patch("cli.main.ship_cmd") as mock_ship:
-        result = runner.invoke(app, ["ship"])
+        result = runner.invoke(app, ["ship", "--programmatic"])
+    assert result.exit_code == 0
     mock_ship.assert_called_once()
+
+def test_ship_aborted_by_user(tmp_path, monkeypatch):
+    """
+    Contract: ship exits gracefully if user rejects confirmation.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".hamilton_doctor").write_text("status=pass\nstrategy=full\nram_gb=16.0\n")
+
+    with patch("cli.main.Confirm.ask", return_value=False):
+        result = runner.invoke(app, ["ship"])
+    
+    assert result.exit_code == 0
+    assert "Aborted by user" in result.output
 
 def test_audit_blocked_without_doctor(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
