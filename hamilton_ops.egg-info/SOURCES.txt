@@ -7,7 +7,9 @@ cli/audit.py
 cli/doctor.py
 cli/main.py
 cli/ship.py
+cli/ui.py
 core/__init__.py
+core/config.py
 core/exceptions.py
 core/priorities.py
 core/stage.py
