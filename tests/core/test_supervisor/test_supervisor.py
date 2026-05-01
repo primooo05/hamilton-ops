@@ -68,12 +68,12 @@ class _FakeDriver:
     def __call__(self, **kwargs):
         return self
 
-    def run(self):
+    async def run(self):
         if self._raises:
             raise self._raises
         return self._result
 
-    def check_health(self):
+    async def check_health(self):
         if self._health_exc:
             raise self._health_exc
         return SimpleNamespace(success=True, output={"version": "fake"})
@@ -86,9 +86,12 @@ class _FakeDriver:
 class _FakeAsyncDriver(_FakeDriver):
     """Async variant for ConstructionDriver which uses asyncio natively."""
     async def run(self):
+        # Yield control so concurrent tasks can start — mimics a real long build.
         await asyncio.sleep(10)
-        return super().run()
-        
+        if self._raises:
+            raise self._raises
+        return self._result
+
     async def terminate(self):
         super().terminate()
 class _FakeRegistry:

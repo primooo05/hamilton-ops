@@ -145,9 +145,20 @@ class LinterDriver:
                 f"Linter binary '{self.tool_cmd[0]}' not found during execution.",
                 context={"exit_code": code, "tool": self.tool_cmd[0], "stderr": stderr},
             )
-        violation_count = len([l for l in stdout.splitlines() if l.strip()])
+
+        # Count violations from stdout (standard for flake8/eslint).
+        stdout_lines = [l for l in stdout.splitlines() if l.strip()]
+        violation_count = len(stdout_lines)
+
+        if violation_count > 0:
+            msg = f"Linter detected {violation_count} violation(s) in staging area."
+        else:
+            # If stdout is empty but code is non-zero, it's likely a config/syntax error in stderr.
+            summary = stderr.splitlines()[0] if stderr.strip() else "Unknown error"
+            msg = f"Linter failed (exit {code}): {summary}"
+
         raise QualityViolation(
-            f"Linter detected {violation_count} violation(s) in staging area.",
+            msg,
             context={
                 "exit_code": code,
                 "tool": self.tool_cmd[0],

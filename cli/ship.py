@@ -97,7 +97,11 @@ def build_registry(config: SupervisorConfig):
     # thresholds are passed from SupervisorConfig so .hamilton.toml [validation] values
     # propagate all the way to the driver that enforces them.
     registry.register("k6", Priority.P1_VALIDATION)(
-        lambda stage_path=None: K6Driver(script_path=config.k6_script, thresholds=config.thresholds)
+        lambda stage_path=None: K6Driver(
+            script_path=config.k6_script,
+            thresholds=config.thresholds,
+            target=config.validation_target,
+        )
     )
 
     # LinterDriver requires stage_path at execution time, but check_health()
@@ -135,6 +139,7 @@ def ship_cmd(
     strict: bool = False,
     linter_cmd: Optional[List[str]] = None,
     cache_ref: Optional[str] = None,
+    target: Optional[str] = None,
 ):
     """Orchestrate the full P1/P2/P3 mission.
 
@@ -147,6 +152,7 @@ def ship_cmd(
         linter_cmd: Custom linter command list, e.g. ``["eslint", "--ext", ".js"]``.
                     Defaults to flake8 if not provided.
         cache_ref:  BuildKit registry cache reference for CI layer caching.
+        target:     Base URL for k6 validation (default: http://localhost).
     """
     state = get_doctor_state()
     check_doctor_freshness(state)
@@ -165,6 +171,8 @@ def ship_cmd(
     resolved_image_tag  = image_tag  or toml_project.get("image_tag",  "hamilton/app:latest")
     resolved_cache_ref  = cache_ref  or toml_project.get("cache_ref",  None)
     resolved_k6_script  = toml_project.get("k6_script", "tests/p1_validation.js")
+    # k6_target: CLI > TOML [project].k6_target > http://localhost
+    resolved_k6_target  = target or toml_project.get("k6_target", "http://localhost")
     # linter_cmd: CLI beats TOML; if neither provided, LinterDriver falls back to ["flake8"]
     resolved_linter_cmd = linter_cmd or toml_quality.get("linter_cmd") or None
     # project_name: CLI > TOML [project].name > directory name
@@ -205,11 +213,14 @@ def ship_cmd(
             "SUPERVISOR: [yellow]No lockfile found — BuildKit cache will not be scoped.[/yellow]"
         )
 
+    # binary_path: TOML [project].binary_path > dist/app.bin
+    resolved_binary_path = toml_project.get("binary_path", "dist/app.bin")
+
     config = SupervisorConfig(
         project_name=project_name,
         source_path=stage,
         image_tag=resolved_image_tag,
-        binary_path="dist/app.bin",
+        binary_path=resolved_binary_path,
         k6_script=resolved_k6_script,
         dockerfile=resolved_dockerfile,
         strict=strict,
@@ -219,6 +230,7 @@ def ship_cmd(
         cache_ref=resolved_cache_ref,
         project_hash=project_hash or None,  # pass None if empty — driver skips flag
         thresholds=resolved_thresholds,
+        validation_target=resolved_k6_target,
     )
 
     registry = build_registry(config)
@@ -246,7 +258,14 @@ def ship_cmd(
         try:
             report = asyncio.run(supervisor.ship())
             progress.stop() # Stop bars before printing final report
-            console.print("\n[bold green]Mission Completed Successfully[/bold green]")
+            
+            if all(s.outcome == "success" for s in report.stream_results.values()):
+                console.print("\n[bold green]Mission Completed Successfully[/bold green]")
+            else:
+                console.print("\n[bold yellow]Mission Completed with Anomalies[/bold yellow]")
+                # Exit with non-zero code if any part of the flight failed
+                raise SystemExit(1)
+            
             console.print(
                 f"Streams: P1={report.stream_results.get('P1:Validation').outcome}, "
                 f"P2={report.stream_results.get('P2:Quality').outcome}, "

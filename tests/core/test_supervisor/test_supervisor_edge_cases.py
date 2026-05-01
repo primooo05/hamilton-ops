@@ -49,12 +49,12 @@ class _FakeDriver:
     def __call__(self, **kwargs):
         return self
 
-    def run(self):
+    async def run(self):
         if self._raises:
             raise self._raises
         return self._result
 
-    def check_health(self):
+    async def check_health(self):
         if self._health_exc:
             raise self._health_exc
         return SimpleNamespace(success=True, output={"version": "fake"})
@@ -68,8 +68,10 @@ class _FakeAsyncDriver(_FakeDriver):
     async def run(self):
         # Sleep to simulate long-running process, allowing cancellation
         await asyncio.sleep(0.01)
-        return super().run()
-        
+        if self._raises:
+            raise self._raises
+        return self._result
+
     async def terminate(self):
         super().terminate()
 
@@ -336,11 +338,11 @@ async def test_preflight_calls_check_health_on_driver_instance_not_factory(
 
     class _SpyDriver:
         """A driver that records when check_health() is called on it."""
-        def check_health(self):
+        async def check_health(self):
             health_check_calls.append("check_health called on instance")
             return SimpleNamespace(success=True, output={"version": "spy"})
 
-        def run(self):
+        async def run(self):
             return SimpleNamespace(success=True, output={})
 
         async def terminate(self):

@@ -81,12 +81,12 @@ class _SyncFakeDriver:
         # Factory signature — returns self as the driver instance.
         return self
 
-    def run(self):
+    async def run(self):
         if self._raises:
             raise self._raises
         return self._result
 
-    def check_health(self):
+    async def check_health(self):
         if self._health_exc:
             raise self._health_exc
         return DriverResult(success=True, output={"version": "fake-1.0"})
@@ -119,7 +119,7 @@ class _AsyncFakeDriver:
     async def terminate(self):
         self.terminate_called = True
 
-    def check_health(self):
+    async def check_health(self):
         if self._health_exc:
             raise self._health_exc
         return DriverResult(success=True, output={"version": "fake-docker-26"})

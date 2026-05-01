@@ -80,7 +80,15 @@ class StagingContext:
     async def _clear_stage(self):
         """Internal helper to safely remove the staging directory."""
         if self.stage_path.exists():
-            await asyncio.to_thread(partial(shutil.rmtree, self.stage_path))
+            import os
+            import stat
+
+            def handle_remove_readonly(func, path, exc):
+                """Clear the read-only bit and retry the removal."""
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+
+            await asyncio.to_thread(shutil.rmtree, self.stage_path, onerror=handle_remove_readonly)
 
     async def cleanup_zombies(self):
         """

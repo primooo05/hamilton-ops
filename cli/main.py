@@ -84,6 +84,11 @@ def ship(
         "-p",
         help="Run without interactive confirmation prompt.",
     ),
+    target: Optional[str] = typer.Option(
+        None,
+        "--target",
+        help="Base URL for k6 validation (default: http://localhost).",
+    ),
 ):
     """Execute the P1/P2/P3 build and validation streams."""
     from cli.ui import print_welcome_panel, type_text
@@ -104,6 +109,7 @@ def ship(
         strict=strict,
         linter_cmd=linter_cmd or None,
         cache_ref=cache_ref,
+        target=target,
     )
 
 @app.command()

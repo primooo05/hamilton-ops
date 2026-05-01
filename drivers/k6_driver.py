@@ -99,7 +99,15 @@ class K6Driver:
                 self._map_exit_code(returncode, stderr)
 
             metrics = self._parse_metrics_file(json_out)
-            self._check_thresholds(metrics)
+            try:
+                self._check_thresholds(metrics)
+            except ThresholdExceededError as e:
+                # If we have a total failure, attach stderr to the exception context
+                # so the user can see WHY k6 couldn't connect.
+                if metrics.get("error_rate", 0.0) >= 100.0:
+                    e.context["k6_stderr"] = stderr
+                    logger.error("K6: Total validation failure. Diagnostics:\n%s", stderr)
+                raise
 
         return DriverResult(
             success=True,
@@ -146,11 +154,14 @@ class K6Driver:
         Asynchronous wrapper for subprocess execution.
         Returns (stdout, stderr, returncode).
         """
+        import os
+        merged_env = {**os.environ, **(env or {})}
+        
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=merged_env,
         )
         try:
             stdout_bytes, stderr_bytes = await proc.communicate()
@@ -218,7 +229,10 @@ class K6Driver:
         if p99 > self.thresholds.p99_ms:
             violations.append(f"P99 latency {p99:.1f}ms exceeds threshold {self.thresholds.p99_ms}ms")
         if error_rate > self.thresholds.error_rate_percent:
-            violations.append(f"Error rate {error_rate:.2f}% exceeds threshold {self.thresholds.error_rate_percent}%")
+            suffix = ""
+            if error_rate >= 100.0:
+                suffix = f" (Target '{self.target}' may be unreachable)"
+            violations.append(f"Error rate {error_rate:.2f}% exceeds threshold {self.thresholds.error_rate_percent}%{suffix}")
 
         if violations:
             raise ThresholdExceededError(

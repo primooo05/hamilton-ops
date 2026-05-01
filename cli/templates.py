@@ -12,6 +12,7 @@ name = "{name}"
 image_tag = "{name}:latest"
 dockerfile = "Dockerfile"
 k6_script = "tests/p1_validation.js"
+binary_path = "{binary_path}"
 
 [quality]
 linter_cmd = {linter_cmd}
@@ -28,6 +29,7 @@ memory_gb = 4
 TEMPLATES = {
     "node": _BASE_TOML.format(
         name="{name}",
+        binary_path="package.json",
         linter_cmd='["npm", "run", "lint"]',
         p95_ms=250,
         p99_ms=600,
@@ -35,6 +37,7 @@ TEMPLATES = {
     ),
     "python": _BASE_TOML.format(
         name="{name}",
+        binary_path="pyproject.toml",
         linter_cmd='["flake8", "."]',
         p95_ms=200,
         p99_ms=500,
@@ -42,6 +45,7 @@ TEMPLATES = {
     ),
     "rust": _BASE_TOML.format(
         name="{name}",
+        binary_path="target/release/{name}",
         linter_cmd='["cargo", "clippy", "--", "-D", "warnings"]',
         p95_ms=100,
         p99_ms=250,
@@ -49,6 +53,7 @@ TEMPLATES = {
     ),
     "go": _BASE_TOML.format(
         name="{name}",
+        binary_path="{name}",
         linter_cmd='["golangci-lint", "run"]',
         p95_ms=100,
         p99_ms=250,
@@ -56,6 +61,7 @@ TEMPLATES = {
     ),
     "generic": _BASE_TOML.format(
         name="{name}",
+        binary_path="dist/app.bin",
         linter_cmd='["echo", "No linter configured"]',
         p95_ms=200,
         p99_ms=500,

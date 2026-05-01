@@ -190,6 +190,7 @@ class SupervisorConfig:
     concurrency_strategy: str = "full"  # "full", "reduced", "minimal"
     docker_memory_gb: int = 4
     thresholds: FlightThresholds = field(default_factory=FlightThresholds)
+    validation_target: str = "http://localhost"
 
 
 class HamiltonSupervisor:
@@ -416,27 +417,35 @@ class HamiltonSupervisor:
                 await self._run_p3_task(stage_path)
 
         except _ExceptionGroup as eg:
-            # Python 3.10 compatible except* logic
-            # Extract specific exceptions and leave the rest in a new group.
-            
+            # Python 3.10 compatible except* logic.
+            # At this point, _run_p2_task already consumed QualityViolation
+            # internally (see _run_p2_task docstring). The only signals that
+            # should escape the TaskGroup into this handler are:
+            #   - HamiltonAlarm / ThresholdExceededError  (from P1)
+            #   - QualityViolation (strict=True only, after _hamilton_kill)
+            #   - EnvError (from P2 binary failure, or P3 escalation)
+            #   - Any other unexpected exception
+
             p1_alarms = []
             p2_violations = []
             other_exceptions = []
-            
+
             def process_group(group):
                 for e in getattr(group, "exceptions", []):
                     if isinstance(e, HamiltonAlarm):
                         p1_alarms.append(e)
                     elif isinstance(e, QualityViolation):
+                        # strict=True path — already handled in _run_p2_task;
+                        # we absorb here to avoid double-kill.
                         p2_violations.append(e)
                     elif hasattr(e, "exceptions"):
                         process_group(e)
                     else:
                         other_exceptions.append(e)
-            
+
             process_group(eg)
-            
-            # P1 Alarms have highest priority. Kill everything immediately.
+
+            # P1 Alarms have the highest priority — kill everything.
             if p1_alarms:
                 alarm = p1_alarms[0]
                 logger.critical(
@@ -445,28 +454,24 @@ class HamiltonSupervisor:
                 self._report.kill_cause = f"HamiltonAlarm: {alarm}"
                 self._fsm.handle_signal(alarm, Priority.P1_VALIDATION)
                 await self._hamilton_kill(cause="P1:Validation")
-                
-            # If no P1 Alarm, check for QualityViolation
+
             elif p2_violations:
-                violation = p2_violations[0]
-                if self._config.strict:
+                # strict=True: _run_p2_task already fired _hamilton_kill and
+                # set kill_cause. We only reach here if the re-raise escaped
+                # before _hamilton_kill completed. Guard with _kill_fired.
+                if not self._kill_fired:
+                    violation = p2_violations[0]
                     logger.error(
                         "SUPERVISOR [MONITOR]: QualityViolation in --strict mode — executing Hamilton Kill."
                     )
                     self._report.kill_cause = f"QualityViolation(strict): {violation}"
                     self._fsm.handle_signal(violation, Priority.P1_VALIDATION)
-                    await self._hamilton_kill(cause="P1:Validation")
-                else:
-                    logger.warning(
-                        "SUPERVISOR [MONITOR]: QualityViolation detected (non-strict) — continuing mission."
-                    )
-                    self._fsm.handle_signal(violation, Priority.P2_QUALITY)
-                    # If we aren't killing, we must re-raise any other exceptions
-                    if other_exceptions:
-                        raise ExceptionGroup("Unhandled exceptions", other_exceptions) from None
-            
+                    await self._hamilton_kill(cause="P2:Quality(strict)")
+
             else:
-                # No Hamilton signals found; re-raise the entire group.
+                # No Hamilton signals found; unexpected exception — re-raise.
+                if other_exceptions:
+                    raise ExceptionGroup("Unhandled stream exceptions", other_exceptions) from None
                 raise eg from None
 
     async def _run_p1_task(self, stage_path: str | Path) -> None:
@@ -510,10 +515,21 @@ class HamiltonSupervisor:
         """
         P2 Quality stream — wraps LinterDriver.run() in a thread.
 
-        QualityViolation escapes the TaskGroup so the except* handler in
-        _launch() can decide whether to warn or escalate (--strict).
+        Stream isolation contract:
+            The strict/non-strict decision is made HERE, inside the task,
+            so that the TaskGroup never sees an unhandled QualityViolation
+            in non-strict mode. The TaskGroup cancels siblings when any
+            child raises — so absorbing the violation internally is the
+            only way to let P1 and P3 continue after a lint warning.
 
-        EnvError also escapes — a broken linter environment is untrustworthy.
+            strict=False → record outcome="failed", update FSM, do NOT raise.
+                           P1 and P3 are unaffected.
+            strict=True  → set kill_cause BEFORE raising so that sibling
+                           CancelledError handlers can read the correct cause
+                           from self._report.kill_cause immediately.
+
+        EnvError escapes in all cases — a broken linter binary is untrustworthy
+        and must be treated like a system-level alarm.
         """
         result_slot = StreamResult(name="P2:Quality")
         self._report.stream_results["P2:Quality"] = result_slot
@@ -527,10 +543,33 @@ class HamiltonSupervisor:
             if self._progress and self._p2_task is not None:
                 self._progress.update(self._p2_task, completed=100)
 
-        except (QualityViolation, EnvError) as exc:
+        except QualityViolation as exc:
             result_slot.outcome = "failed"
             result_slot.exception = exc
-            raise  # Escape to _launch() except* handler.
+
+            if self._config.strict:
+                # --strict: stamp kill_cause NOW so sibling cancelled_by reads
+                # the correct label the moment CancelledError is injected.
+                self._report.kill_cause = f"QualityViolation(strict): {exc}"
+                self._fsm.handle_signal(exc, Priority.P1_VALIDATION)
+                await self._hamilton_kill(cause="P2:Quality(strict)")
+                # Re-raise so the TaskGroup tears down cleanly and _launch()
+                # except* handler can record the escalation.
+                raise
+            else:
+                # Non-strict: absorb the violation here — do NOT re-raise.
+                # Escaping would cause TaskGroup to cancel P1 and P3, which
+                # contradicts the "warn and continue" semantics.
+                logger.warning(
+                    "SUPERVISOR [MONITOR]: QualityViolation detected (non-strict) — continuing mission."
+                )
+                self._fsm.handle_signal(exc, Priority.P2_QUALITY)
+
+        except EnvError as exc:
+            # A broken linter binary is a system-level failure — always escapes.
+            result_slot.outcome = "failed"
+            result_slot.exception = exc
+            raise
 
         except asyncio.CancelledError:
             # P2 was cancelled by a P1 HamiltonAlarm killing the group.
