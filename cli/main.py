@@ -7,6 +7,7 @@ from rich.prompt import Confirm
 from cli.doctor import doctor_cmd
 from cli.ship import ship_cmd
 from cli.audit import audit_cmd
+from cli.init import init_cmd
 
 app = typer.Typer(
     help="Hamilton-Ops CLI — Validate, Build, and Audit with Priority Awareness",
@@ -36,6 +37,19 @@ def doctor(
 ):
     """Run pre-flight diagnostics to validate hardware and environment."""
     doctor_cmd(fix=fix)
+
+@app.command()
+def init(
+    path: Path = typer.Option(Path("."), "--path", help="Project root to initialize"),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing configuration files"),
+    programmatic: bool = typer.Option(
+        False,
+        "--programmatic", "-p",
+        help="Skip interactive prompts; auto-select the first detected component.",
+    ),
+):
+    """Scan a project directory and scaffold a tailored Hamilton-Ops configuration."""
+    init_cmd(path=path, force=force, programmatic=programmatic)
 
 @app.command()
 def ship(
@@ -82,9 +96,6 @@ def ship(
 
     if not programmatic:
         type_text(f"Mission Plan: Execute P1/P2/P3 streams for project [bold]{project or stage.resolve().name}[/bold].", delay=0.01)
-        if not Confirm.ask("[bold yellow]Ready for ignition?[/bold yellow]", default=False):
-            console.print("[dim]Aborted by user.[/dim]")
-            raise typer.Exit(code=0)
 
     ship_cmd(
         stage=stage,

@@ -140,7 +140,8 @@ def test_violation_count_ignores_empty_lines():
     assert exc_info.value.context["violations"] == 1
 
 
-def test_check_health_raises_env_error_when_binary_missing():
+@pytest.mark.asyncio
+async def test_check_health_raises_env_error_when_binary_missing():
     """
     Contract: check_health() must raise EnvError when the linter binary
     is not on PATH — enabling 'hamilton doctor' to report a missing tool.
@@ -148,28 +149,31 @@ def test_check_health_raises_env_error_when_binary_missing():
     driver = _make_driver()
     with patch("drivers.linter_driver.shutil.which", return_value=None):
         with pytest.raises(EnvError) as exc_info:
-            driver.check_health()
+            await driver.check_health()
 
     assert exc_info.value.context["tool"] == "flake8"
 
 
-def test_check_health_returns_driver_result_on_success():
+@pytest.mark.asyncio
+async def test_check_health_returns_driver_result_on_success():
     """
     Contract: check_health() must return DriverResult(success=True) with
     a version key when the binary is found and responsive.
     """
     driver = _make_driver()
     with patch("drivers.linter_driver.shutil.which", return_value="/usr/bin/flake8"):
-        driver._run_subprocess = MagicMock(
-            return_value=_completed(returncode=0, stdout="6.0.0 (mccabe: 0.7.0)\n")
+        from unittest.mock import AsyncMock
+        driver._run_subprocess_async = AsyncMock(
+            return_value=("6.0.0 (mccabe: 0.7.0)\n", "", 0)
         )
-        result = driver.check_health()
+        result = await driver.check_health()
 
     assert result.success is True
     assert "version" in result.output
 
 
-def test_check_health_uses_configured_binary():
+@pytest.mark.asyncio
+async def test_check_health_uses_configured_binary():
     """
     Contract: check_health() must check for the configured binary name,
     not hardcoded 'flake8' — supporting any linter tool.
@@ -177,63 +181,71 @@ def test_check_health_uses_configured_binary():
     driver = _make_driver(tool_cmd=["ruff"])
     with patch("drivers.linter_driver.shutil.which", return_value=None) as mock_which:
         try:
-            driver.check_health()
+            await driver.check_health()
         except EnvError as exc:
             assert exc.context["tool"] == "ruff"
         mock_which.assert_called_with("ruff")
 
 
 
-def test_run_returns_driver_result_on_clean_code():
+@pytest.mark.asyncio
+async def test_run_returns_driver_result_on_clean_code():
     """
     Contract: run() must return DriverResult(success=True) when the linter
     exits 0 — indicating the staging area has no quality violations.
     """
     driver = _make_driver()
-    driver._run_subprocess = MagicMock(return_value=_completed(returncode=0, stdout=""))
-    result = driver.run()
+    from unittest.mock import AsyncMock
+    driver._run_subprocess_async = AsyncMock(return_value=("", "", 0))
+    result = await driver.run()
 
     assert result.success is True
     assert result.output["violations"] == 0
 
 
-def test_run_raises_quality_violation_on_linter_failure():
+@pytest.mark.asyncio
+async def test_run_raises_quality_violation_on_linter_failure():
     """
     Contract: run() must raise QualityViolation (not return a failed result)
     when the linter reports issues — the P2 stream signals the Supervisor.
     """
     stdout = "app.py:1:1: E302 missing blank lines\n"
     driver = _make_driver()
-    driver._run_subprocess = MagicMock(return_value=_completed(returncode=1, stdout=stdout))
+    from unittest.mock import AsyncMock
+    driver._run_subprocess_async = AsyncMock(return_value=(stdout, "", 1))
 
     with pytest.raises(QualityViolation):
-        driver.run()
+        await driver.run()
 
 
-def test_run_raises_env_error_on_exit_127():
+@pytest.mark.asyncio
+async def test_run_raises_env_error_on_exit_127():
     """
     Contract: run() must raise EnvError (not QualityViolation) on exit 127,
     clearly distinguishing an environment failure from a code quality issue.
     """
     driver = _make_driver()
-    driver._run_subprocess = MagicMock(return_value=_completed(returncode=127, stderr="not found"))
+    from unittest.mock import AsyncMock
+    driver._run_subprocess_async = AsyncMock(return_value=("", "not found", 127))
 
     with pytest.raises(EnvError):
-        driver.run()
+        await driver.run()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool_cmd", [
     ["flake8"],
     ["ruff", "check"],
     ["eslint", "--ext", ".js"],
 ])
-def test_run_works_with_different_linter_tools(tool_cmd):
+async def test_run_works_with_different_linter_tools(tool_cmd):
     """
     Contract: The driver must be tool-agnostic — any configured linter command
     must produce a valid DriverResult on success without code changes.
     """
     driver = LinterDriver(stage_path="/tmp/stage", tool_cmd=tool_cmd)
-    driver._run_subprocess = MagicMock(return_value=_completed(returncode=0, stdout=""))
-    result = driver.run()
+    from unittest.mock import AsyncMock
+    driver._run_subprocess_async = AsyncMock(return_value=("", "", 0))
+    result = await driver.run()
 
     assert result.success is True

@@ -197,3 +197,31 @@ def test_precedence_cli_project_beats_toml_name(tmp_path):
     resolved = cli_project or toml_project.get("name") or directory_fallback
 
     assert resolved == "cli-name"
+
+
+def test_load_checks_hidden_hamilton_folder(tmp_path):
+    """
+    VERIFY: load_hamilton_config checks project_root/.hamilton/.hamilton.toml
+    if no config is found at the root level.
+
+    Allows for cleaner root directories.
+    """
+    hidden_dir = tmp_path / ".hamilton"
+    hidden_dir.mkdir()
+    (hidden_dir / ".hamilton.toml").write_text("[project]\nname = \"hidden-config\"\n")
+
+    config = load_hamilton_config(tmp_path)
+    assert config["project"]["name"] == "hidden-config"
+
+
+def test_load_root_beats_hidden_folder(tmp_path):
+    """
+    VERIFY: If BOTH root and hidden folder configs exist, the root level wins.
+    """
+    (tmp_path / ".hamilton.toml").write_text("[project]\nname = \"root-config\"\n")
+    hidden_dir = tmp_path / ".hamilton"
+    hidden_dir.mkdir()
+    (hidden_dir / ".hamilton.toml").write_text("[project]\nname = \"hidden-config\"\n")
+
+    config = load_hamilton_config(tmp_path)
+    assert config["project"]["name"] == "root-config"

@@ -459,10 +459,14 @@ class ConstructionDriver:
         try:
             stdout_lines = await self._stream_output(proc)
         finally:
-            # Always clear the process handle, even if _stream_output raises.
-            self._proc = None
+            # DO NOT clear self._proc here. If the task is cancelled, 
+            # Supervisor calls terminate() which needs this handle to reap 
+            # the subprocess on Windows.
+            pass
 
         returncode = proc.returncode
+        self._proc = None  # Process is done, clear the handle.
+
         if returncode != 0:
             stderr_tail = "\n".join(stdout_lines[-20:]) if stdout_lines else ""
             self._map_exit_code(returncode, stderr_tail, aborted=self._aborted)
@@ -529,12 +533,18 @@ class ConstructionDriver:
                 logger.debug("CONSTRUCTION: Process %d already exited.", pid)
         else:
             # Windows fallback: kills the process directly.
-            self._proc.kill()
+            try:
+                self._proc.kill()
+                # Crucial for Windows ProactorEventLoop: await wait() so the 
+                # pipes are closed gracefully by the loop before we clear the handle.
+                await self._proc.wait()
+            except ProcessLookupError:
+                pass
 
         logger.info("CONSTRUCTION: BuildKit process group reaped.")
         self._proc = None
 
-    def check_health(self) -> DriverResult:
+    async def check_health(self) -> DriverResult:
         """
         Verify Docker is available, daemon is reachable, and running rootless.
 
@@ -551,15 +561,25 @@ class ConstructionDriver:
                 context={"tool": "docker"},
             )
 
-        info_result = self._run_subprocess(["docker", "info", "--format", "{{json .}}"])
-        if info_result.returncode != 0:
+        try:
+            stdout, stderr, returncode = await self._run_subprocess_async(["docker", "info", "--format", "{{json .}}"])
+        except FileNotFoundError:
+            # Platform-specific guard (WinError 2) for cases where shutil.which passes
+            # but execution fails (e.g. race condition or PATH inconsistency).
             raise EnvError(
-                f"Docker daemon is not reachable: {info_result.stderr.strip()}",
-                context={"tool": "docker", "exit_code": info_result.returncode},
+                "docker binary not found on PATH. "
+                "Install Docker from https://docs.docker.com/get-docker/",
+                context={"tool": "docker"},
+            )
+
+        if returncode != 0:
+            raise EnvError(
+                f"Docker daemon is not reachable: {stderr.strip()}",
+                context={"tool": "docker", "exit_code": returncode},
             )
 
         try:
-            info = _json.loads(info_result.stdout)
+            info = _json.loads(stdout)
             security_options: list = info.get("SecurityOptions", [])
             # On Windows, Docker Desktop uses WSL2 as its backend.
             # The Windows-side daemon never reports "rootless" in SecurityOptions
@@ -579,9 +599,37 @@ class ConstructionDriver:
         except _json.JSONDecodeError:
             logger.warning("CONSTRUCTION: Could not parse 'docker info' JSON — rootless check skipped.")
 
-        version_result = self._run_subprocess(["docker", "version", "--format", "{{.Server.Version}}"])
-        version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
+        v_stdout, v_stderr, v_code = await self._run_subprocess_async(["docker", "version", "--format", "{{.Server.Version}}"])
+        version = v_stdout.strip() if v_code == 0 else "unknown"
         return DriverResult(success=True, output={"version": version})
+
+    async def _run_subprocess_async(self, cmd: list[str]) -> tuple[str, str, int]:
+        """
+        Execute a subprocess asynchronously and return (stdout, stderr, returncode).
+        
+        This is a non-blocking wrapper around create_subprocess_exec used for 
+        health checks and metadata queries.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await proc.communicate()
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                proc.returncode or 0
+            )
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            raise
 
 
     def _build_command(self) -> list[str]:
@@ -711,12 +759,6 @@ class ConstructionDriver:
         await proc.wait()
         return lines
 
-    def _run_subprocess(self, cmd: list[str]) -> subprocess.CompletedProcess:
-        """
-        Thin wrapper around subprocess.run — used for health checks only.
-        Patch this in tests for check_health() coverage.
-        """
-        return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def _redact_build_args(cmd: list[str]) -> list[str]:

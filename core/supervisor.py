@@ -37,7 +37,9 @@ import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Type, TypeVar, Union
+if TYPE_CHECKING:
+    from rich.progress import Progress, TaskID
 
 from exceptiongroup import ExceptionGroup, BaseExceptionGroup
 
@@ -154,7 +156,7 @@ class ForensicReport:
     cleanup_ok: bool = False
     strict_mode: bool = False
 
-@dataclass
+@dataclass(frozen=True)
 class SupervisorConfig:
     """
     Mission parameters passed to the Supervisor at construction time.
@@ -179,6 +181,7 @@ class SupervisorConfig:
     image_tag: str
     binary_path: str | Path
     k6_script: str | Path
+    dockerfile: Optional[str | Path] = None
     strict: bool = False
     cache_ref: Optional[str] = None
     project_hash: Optional[str] = None
@@ -207,14 +210,16 @@ class HamiltonSupervisor:
           called to reap the Docker subprocess when a P1 Alarm fires.
     """
 
-    def __init__(self, config: SupervisorConfig, registry) -> None:
+    def __init__(self, config: SupervisorConfig, registry, progress: Optional["Progress"] = None) -> None:
         """
         Args:
             config:   Mission parameters (paths, flags, project name).
             registry: DriverRegistry instance with k6, linter, docker registered.
+            progress: Rich progress bar instance.
         """
         self._config = config
         self._registry = registry
+        self._progress = progress
         self._fsm = StateMachine()
         self._report = ForensicReport(
             project=config.project_name,
@@ -338,9 +343,9 @@ class HamiltonSupervisor:
         linter_health = linter_factory(stage_path=None)
         docker_health = docker_factory(stage_path=None)
 
-        await asyncio.to_thread(k6_health.check_health)
-        await asyncio.to_thread(linter_health.check_health)
-        await asyncio.to_thread(docker_health.check_health)
+        await k6_health.check_health()
+        await linter_health.check_health()
+        await docker_health.check_health()
 
         # Stage the source — this creates an immutable snapshot.
         logger.info("SUPERVISOR [PRE-FLIGHT]: Staging source at %s", self._config.source_path)
@@ -375,6 +380,11 @@ class HamiltonSupervisor:
         logger.info("SUPERVISOR [LAUNCH]: Starting P1/P2/P3 streams concurrently.")
 
         try:
+            if self._progress:
+                self._p1_task = self._progress.add_task("[cyan]P1: Validation[/cyan]", total=100)
+                self._p2_task = self._progress.add_task("[magenta]P2: Quality[/magenta]", total=100)
+                self._p3_task = self._progress.add_task("[yellow]P3: Construction[/yellow]", total=100)
+
             async with TaskGroup() as tg:
                 if self._config.concurrency_strategy == "full":
                     # P1 + P2 + P3 (Parallel)
@@ -453,7 +463,7 @@ class HamiltonSupervisor:
                     self._fsm.handle_signal(violation, Priority.P2_QUALITY)
                     # If we aren't killing, we must re-raise any other exceptions
                     if other_exceptions:
-                        raise _ExceptionGroup[0]("Unhandled exceptions", other_exceptions) from None
+                        raise ExceptionGroup("Unhandled exceptions", other_exceptions) from None
             
             else:
                 # No Hamilton signals found; re-raise the entire group.
@@ -474,8 +484,10 @@ class HamiltonSupervisor:
         try:
             k6_driver_factory = self._registry.get("k6")
             k6_driver = k6_driver_factory(stage_path=stage_path)
-            result = await asyncio.to_thread(k6_driver.run)
+            result = await k6_driver.run()
             result_slot.outcome = "success"
+            if self._progress and self._p1_task is not None:
+                self._progress.update(self._p1_task, completed=100)
             # Store raw k6 telemetry for forensic report.
             if result and result.output:
                 self._report.p1_metrics = result.output
@@ -510,8 +522,10 @@ class HamiltonSupervisor:
         try:
             linter_driver_factory = self._registry.get("linter")
             linter_driver = linter_driver_factory(stage_path=stage_path)
-            await asyncio.to_thread(linter_driver.run)
+            await linter_driver.run()
             result_slot.outcome = "success"
+            if self._progress and self._p2_task is not None:
+                self._progress.update(self._p2_task, completed=100)
 
         except (QualityViolation, EnvError) as exc:
             result_slot.outcome = "failed"
@@ -565,6 +579,8 @@ class HamiltonSupervisor:
             # Direct await — driver.run() is async and non-blocking.
             p3_result = await driver.run()
             result_slot.outcome = "success"
+            if self._progress and self._p3_task is not None:
+                self._progress.update(self._p3_task, completed=100)
 
             # Propagate artifact_path so _post_flight() can hand it to AuditChain.
             # Stored on the supervisor so _post_flight() can read it without

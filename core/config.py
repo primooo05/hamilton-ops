@@ -101,13 +101,23 @@ def load_hamilton_config(config_path: str | Path) -> dict:
         ValueError:  If the TOML file cannot be parsed (syntax error).
     """
     path = Path(config_path)
-
+    
     # Handle both "path to directory" and "path to file" callers.
     if path.is_dir():
-        path = path / ".hamilton.toml"
+        # Priority 1: Standard root config
+        root_config = path / ".hamilton.toml"
+        # Priority 2: Hidden .hamilton folder config
+        hidden_config = path / ".hamilton" / ".hamilton.toml"
+        
+        if root_config.exists():
+            path = root_config
+        elif hidden_config.exists():
+            path = hidden_config
+        else:
+            path = root_config # fall back to root path for the "not exists" check below
 
     if not path.exists():
-        logger.debug("CONFIG: No .hamilton.toml found at %s — using defaults.", path)
+        logger.debug("CONFIG: No .hamilton.toml found — using defaults.")
         return {}
 
     # Resolve TOML parser — stdlib on 3.11+, tomli backport on 3.10.

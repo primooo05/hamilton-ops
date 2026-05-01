@@ -116,6 +116,8 @@ def build_registry(config: SupervisorConfig):
         lambda stage_path=None: ConstructionDriver(
             stage_path=stage_path if stage_path is not None else Path("."),
             image_tag=config.image_tag,
+            dockerfile=config.dockerfile,
+            artifact_subpath=config.binary_path,
             cache_ref=config.cache_ref,
             project_hash=config.project_hash,
             secrets=config.secrets,
@@ -167,6 +169,8 @@ def ship_cmd(
     resolved_linter_cmd = linter_cmd or toml_quality.get("linter_cmd") or None
     # project_name: CLI > TOML [project].name > directory name
     project_name = project or toml_project.get("name") or Path(stage).resolve().name
+    # dockerfile: CLI > TOML [project].dockerfile > stage/Dockerfile
+    resolved_dockerfile = toml_project.get("dockerfile", None)
     # Load FlightThresholds from [validation] section; falls back to spec defaults if absent
     resolved_thresholds = FlightThresholds.from_config(toml_config)
 
@@ -207,6 +211,7 @@ def ship_cmd(
         image_tag=resolved_image_tag,
         binary_path="dist/app.bin",
         k6_script=resolved_k6_script,
+        dockerfile=resolved_dockerfile,
         strict=strict,
         concurrency_strategy=strategy,
         docker_memory_gb=docker_memory,
@@ -217,16 +222,37 @@ def ship_cmd(
     )
 
     registry = build_registry(config)
-    supervisor = HamiltonSupervisor(config, registry)
 
-    try:
-        report = asyncio.run(supervisor.ship())
-        console.print("\n[bold green]Mission Completed Successfully[/bold green]")
-        console.print(
-            f"Streams: P1={report.stream_results.get('P1:Validation').outcome}, "
-            f"P2={report.stream_results.get('P2:Quality').outcome}, "
-            f"P3={report.stream_results.get('P3:Construction').outcome}"
-        )
-    except Exception as e:
-        console.print(f"\n[bold red]Mission Failed:[/bold red] {e}")
-        raise SystemExit(1)
+    from rich.progress import (
+        Progress,
+        TextColumn,
+        BarColumn,
+        TaskProgressColumn,
+        TimeRemainingColumn,
+        SpinnerColumn
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        supervisor = HamiltonSupervisor(config, registry, progress=progress)
+
+        try:
+            report = asyncio.run(supervisor.ship())
+            progress.stop() # Stop bars before printing final report
+            console.print("\n[bold green]Mission Completed Successfully[/bold green]")
+            console.print(
+                f"Streams: P1={report.stream_results.get('P1:Validation').outcome}, "
+                f"P2={report.stream_results.get('P2:Quality').outcome}, "
+                f"P3={report.stream_results.get('P3:Construction').outcome}"
+            )
+        except Exception as e:
+            progress.stop()
+            console.print(f"\n[bold red]Mission Failed:[/bold red] {e}")
+            raise SystemExit(1)

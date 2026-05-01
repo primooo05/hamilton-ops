@@ -266,7 +266,8 @@ def test_map_exit_code_generic_non_zero_raises_hamilton_alarm():
     assert exc_info.value.context["exit_code"] == 1
 
 
-def test_check_health_raises_env_error_when_k6_missing():
+@pytest.mark.asyncio
+async def test_check_health_raises_env_error_when_k6_missing():
     """
     Contract: check_health() must raise EnvError (not HamiltonAlarm) when
     k6 is absent — this is a pre-flight environment failure, not a P1 alarm.
@@ -275,40 +276,45 @@ def test_check_health_raises_env_error_when_k6_missing():
     # Patch shutil.which to simulate k6 not being on PATH
     with patch("drivers.k6_driver.shutil.which", return_value=None):
         with pytest.raises(EnvError) as exc_info:
-            driver.check_health()
+            await driver.check_health()
 
     assert exc_info.value.context["tool"] == "k6"
 
 
-def test_check_health_raises_env_error_when_version_fails():
+@pytest.mark.asyncio
+async def test_check_health_raises_env_error_when_version_fails():
     """
     Contract: If k6 is on PATH but ``k6 version`` returns non-zero,
     check_health() must still raise EnvError.
     """
     driver = _make_driver()
     with patch("drivers.k6_driver.shutil.which", return_value="/usr/local/bin/k6"):
-        driver._run_subprocess = MagicMock(return_value=_completed(returncode=1, stderr="error"))
+        from unittest.mock import AsyncMock
+        driver._run_subprocess_async = AsyncMock(return_value=("", "error", 1))
         with pytest.raises(EnvError):
-            driver.check_health()
+            await driver.check_health()
 
 
-def test_check_health_returns_driver_result_on_success():
+@pytest.mark.asyncio
+async def test_check_health_returns_driver_result_on_success():
     """
     Contract: A successful health check must return DriverResult(success=True)
     containing the version string — used by 'hamilton doctor' reporting.
     """
     driver = _make_driver()
     with patch("drivers.k6_driver.shutil.which", return_value="/usr/local/bin/k6"):
-        driver._run_subprocess = MagicMock(
-            return_value=_completed(returncode=0, stdout="k6 v0.49.0 (go1.21.0)")
+        from unittest.mock import AsyncMock
+        driver._run_subprocess_async = AsyncMock(
+            return_value=("k6 v0.49.0 (go1.21.0)", "", 0)
         )
-        result = driver.check_health()
+        result = await driver.check_health()
 
     assert isinstance(result.output, dict)
     assert "version" in result.output
     
 
-def test_run_returns_driver_result_on_success(tmp_path):
+@pytest.mark.asyncio
+async def test_run_returns_driver_result_on_success(tmp_path):
     """
     Contract: run() must return DriverResult(success=True) when k6 exits 0
     and all metrics are within thresholds.
@@ -316,55 +322,57 @@ def test_run_returns_driver_result_on_success(tmp_path):
     """
     driver = _make_driver(thresholds=FlightThresholds(p95_ms=200, p99_ms=500, error_rate_percent=1.0))
 
-    def fake_run(cmd):
+    async def fake_run(cmd, env=None):
         # Locate the json output path from the command and write fake metrics
         for i, arg in enumerate(cmd):
             if arg == "--out":
                 json_path = Path(cmd[i + 1].replace("json=", ""))
                 _write_k6_json(json_path, p95=150.0, p99=300.0, error_rate_fraction=0.001)
                 break
-        return _completed(returncode=0)
+        return ("", "", 0)
 
-    driver._run_subprocess = fake_run
-    result = driver.run()
+    driver._run_subprocess_async = fake_run
+    result = await driver.run()
 
     assert result.success is True
     assert result.output["p95_ms"] == pytest.approx(150.0)
 
 
-def test_run_raises_threshold_exceeded_error_on_high_p95(tmp_path):
+@pytest.mark.asyncio
+async def test_run_raises_threshold_exceeded_error_on_high_p95(tmp_path):
     """
     Contract: run() must raise ThresholdExceededError (not return a DriverResult)
     when k6 reports a P95 above the configured threshold.
     """
     driver = _make_driver(thresholds=FlightThresholds(p95_ms=200, p99_ms=500, error_rate_percent=1.0))
 
-    def fake_run(cmd):
+    async def fake_run(cmd, env=None):
         for i, arg in enumerate(cmd):
             if arg == "--out":
                 json_path = Path(cmd[i + 1].replace("json=", ""))
                 _write_k6_json(json_path, p95=999.0, p99=1500.0, error_rate_fraction=0.0)
                 break
-        return _completed(returncode=0)
+        return ("", "", 0)
 
-    driver._run_subprocess = fake_run
+    driver._run_subprocess_async = fake_run
 
     with pytest.raises(ThresholdExceededError):
-        driver.run()
+        await driver.run()
 
 
-def test_run_raises_hamilton_alarm_on_nonzero_exit(tmp_path):
+@pytest.mark.asyncio
+async def test_run_raises_hamilton_alarm_on_nonzero_exit(tmp_path):
     """
     Contract: run() must raise HamiltonAlarm when k6 crashes (non-zero exit)
     and no metrics were written — the validation stream is unrecoverable.
     """
     driver = _make_driver()
 
-    def fake_run(cmd):
+    async def fake_run(cmd, env=None):
         # Do not write any metrics file — simulate a hard crash
-        return _completed(returncode=137, stderr="Killed")
+        return ("", "Killed", 137)
 
-    driver._run_subprocess = fake_run
+    driver._run_subprocess_async = fake_run
 
     with pytest.raises(HamiltonAlarm):
-        driver.run()
+        await driver.run()

@@ -50,7 +50,11 @@ class StagingContext:
                         self.source_path,
                         self.stage_path,
                         symlinks=False,
-                        ignore=shutil.ignore_patterns(".git", ".hamilton", "node_modules", "target"),
+                        ignore=shutil.ignore_patterns(
+                            ".git", ".hamilton", "node_modules", "target", 
+                            ".env*", "venv", ".venv", "__pycache__", 
+                            ".pytest_cache", ".idea", ".vscode", ".DS_Store"
+                        ),
                         dirs_exist_ok=False,  # we just deleted it, fail fast if something recreates it
                     )
                 )
