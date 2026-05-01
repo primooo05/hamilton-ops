@@ -48,7 +48,7 @@ from core.exceptions import (
     QualityViolation,
     StagingError,
 )
-from core.priorities import Priority
+from core.priorities import Priority, FlightThresholds
 from core.stage import StagingContext
 from core.state import FlightState, StateMachine
 from audit.chain import (
@@ -170,6 +170,9 @@ class SupervisorConfig:
         project_hash:   Optional lock-file hash for BuildKit cache scoping.
         secrets:        Optional list of BuildKit --secret specs.
         linter_cmd:     Optional custom linter command list (default: flake8).
+        thresholds:     P1 telemetry thresholds loaded from [validation] in
+                        .hamilton.toml. Defaults to the Hamilton-Ops spec
+                        baseline (p95=200ms, p99=500ms, error_rate=1.0%).
     """
     project_name: str
     source_path: str | Path
@@ -183,6 +186,7 @@ class SupervisorConfig:
     linter_cmd: Optional[list[str]] = None
     concurrency_strategy: str = "full"  # "full", "reduced", "minimal"
     docker_memory_gb: int = 4
+    thresholds: FlightThresholds = field(default_factory=FlightThresholds)
 
 
 class HamiltonSupervisor:

@@ -7,7 +7,7 @@ from rich.console import Console
 
 from core.config import compute_project_hash, load_hamilton_config
 from core.supervisor import HamiltonSupervisor, SupervisorConfig
-from core.priorities import Priority
+from core.priorities import Priority, FlightThresholds
 
 console = Console()
 
@@ -94,8 +94,10 @@ def build_registry(config: SupervisorConfig):
 
     # K6Driver does not use stage_path — it runs against a fixed script.
     # stage_path=None is ignored by K6Driver.__init__ (it takes script_path, not stage_path).
+    # thresholds are passed from SupervisorConfig so .hamilton.toml [validation] values
+    # propagate all the way to the driver that enforces them.
     registry.register("k6", Priority.P1_VALIDATION)(
-        lambda stage_path=None: K6Driver(script_path=config.k6_script)
+        lambda stage_path=None: K6Driver(script_path=config.k6_script, thresholds=config.thresholds)
     )
 
     # LinterDriver requires stage_path at execution time, but check_health()
@@ -150,19 +152,23 @@ def ship_cmd(
     strategy = state.get("strategy", "full")
     ram_gb = float(state.get("ram_gb", 16.0))
 
-    # Default project name to the directory name so forensic logs are
-    # always meaningful even when --project is omitted.
-    project_name = project or Path(stage).resolve().name
 
     toml_config = load_hamilton_config(stage)
     toml_project = toml_config.get("project", {})
     toml_construction = toml_config.get("construction", {})
+    toml_quality = toml_config.get("quality", {})
 
-    # Resolve final values: CLI arg wins, then TOML, then hardcoded default.
+    # Resolve final values following the precedence chain:
+    #   CLI flag > .hamilton.toml > SupervisorConfig default > hardcoded default
     resolved_image_tag  = image_tag  or toml_project.get("image_tag",  "hamilton/app:latest")
     resolved_cache_ref  = cache_ref  or toml_project.get("cache_ref",  None)
     resolved_k6_script  = toml_project.get("k6_script", "tests/p1_validation.js")
-    resolved_linter_cmd = linter_cmd or None  # TOML linter override not modelled yet
+    # linter_cmd: CLI beats TOML; if neither provided, LinterDriver falls back to ["flake8"]
+    resolved_linter_cmd = linter_cmd or toml_quality.get("linter_cmd") or None
+    # project_name: CLI > TOML [project].name > directory name
+    project_name = project or toml_project.get("name") or Path(stage).resolve().name
+    # Load FlightThresholds from [validation] section; falls back to spec defaults if absent
+    resolved_thresholds = FlightThresholds.from_config(toml_config)
 
     console.print(f"SUPERVISOR: Detected execution strategy: [bold cyan]{strategy}[/bold cyan]")
     console.print(f"SUPERVISOR: Project: [bold]{project_name}[/bold]")
@@ -207,6 +213,7 @@ def ship_cmd(
         linter_cmd=resolved_linter_cmd,
         cache_ref=resolved_cache_ref,
         project_hash=project_hash or None,  # pass None if empty — driver skips flag
+        thresholds=resolved_thresholds,
     )
 
     registry = build_registry(config)
