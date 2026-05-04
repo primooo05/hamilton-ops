@@ -5,6 +5,7 @@ Summary: A deterministic, security-hardened CI/CD orchestrator
 Requires-Python: >=3.10
 Requires-Dist: typer>=0.9.0
 Requires-Dist: rich>=13.0.0
+Requires-Dist: pyfiglet>=1.0.2
 Requires-Dist: psutil>=5.9.0
 Requires-Dist: exceptiongroup>=1.1.0; python_version < "3.11"
 Provides-Extra: test
